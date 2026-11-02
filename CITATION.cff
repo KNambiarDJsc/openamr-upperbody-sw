@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "OpenAMRobot upper body: OpenArm 2.0 dual arms on a mobile base with lift"
+authors:
+  - name: "Botshare Ltd"
+  - given-names: "Alex"
+    family-names: "Reznichenko"
+repository-code: "https://github.com/openAMRobot/openamr-upperbody-sw"
+url: "https://docs.openamrobot.ai/"
+license: MIT
+keywords:
+  - openarm
+  - mobile manipulation
+  - ROS 2
+  - MoveIt 2
+  - embodied AI

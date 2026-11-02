@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: MIT
+// ROS 2 Jazzy desktop with the workspace of README.md (Prerequisites) built on create, for GitHub Codespaces and local
+// Dev Containers. The workspace is ~/openamr_ws; its src/ links this checkout and holds openamr-platform-sw and the two
+// OpenArm repositories at the pins of upstream_pins.yaml (.devcontainer/setup.sh). RViz shows in the browser through
+// noVNC on port 6080 (desktop-lite feature, password vscode). Simulation tooling only: no hardware, no evidence.
+{
+  "name": "OpenAMRobot upper body (ROS 2 Jazzy)",
+  "image": "osrf/ros:jazzy-desktop",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "ubuntu",
+      "installZsh": false,
+      "installOhMyZsh": false,
+      "upgradePackages": false
+    },
+    "ghcr.io/devcontainers/features/desktop-lite:1": {
+      "password": "vscode",
+      "webPort": "6080",
+      "vncPort": "5901"
+    }
+  },
+  "remoteUser": "ubuntu",
+  "containerEnv": {
+    "ROS_DISTRO": "jazzy"
+  },
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "8gb"
+  },
+  "onCreateCommand": "bash .devcontainer/setup.sh",
+  "forwardPorts": [6080],
+  "portsAttributes": {
+    "6080": {
+      "label": "noVNC desktop (RViz)",
+      "onAutoForward": "notify"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "redhat.vscode-yaml"]
+    }
+  }
+}

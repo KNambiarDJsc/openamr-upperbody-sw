@@ -1,5 +1,11 @@
 # OpenAMRobot 2.0: open-source mobile base with lift for OpenArm 2.0 dual arms
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/openAMRobot/openamr-upperbody-sw)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Model tests](https://github.com/openAMRobot/openamr-upperbody-sw/actions/workflows/model-tests.yml/badge.svg)](https://github.com/openAMRobot/openamr-upperbody-sw/actions/workflows/model-tests.yml)
+
+Community discussion: [openamr-upperbody-sw discussion #33](https://github.com/openAMRobot/openamr-upperbody-sw/discussions/33)
+
 ![OpenAMRobot 2.0 visualization (assembled, lift raised)](docs/media/hero.png)
 
 *OpenAMRobot 2.0 visualization (assembled, lift raised).*
