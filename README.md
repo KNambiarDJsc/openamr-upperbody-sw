@@ -13,7 +13,7 @@ From the team behind [openamr-platform-sw](https://github.com/openAMRobot/openam
 
 The combined model is here: mobile base, 350 mm lift and two OpenArm 2.0 arms in one URDF, running with MoveIt and Gazebo (verification: [`docs/verification.md`](docs/verification.md)).
 The physical build is underway.
-Platform release v2.0.0-rc.1 lands 20 Nov 2026, the dual-arm hardware follows.
+Platform release v2.0.0-rc.1 is targeted for 20 Nov 2026, the dual-arm hardware follows.
 
 Interactive 3D model: https://docs.openamrobot.ai/assets/roadmap/robot.html
 
@@ -104,7 +104,7 @@ Work in progress: the grippers may not close on the default DART engine. Known i
 
 - **Hardware:** [openamr-platform-hw](https://github.com/openAMRobot/openamr-platform-hw)
 - **Packages and current prices:** [botshare.ai/openamrobot](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#products). First dispatch April 2027.
-- **OpenArm 2.0 Mobile Integration Sprint:** your gripper, tool or use case on the combined model, simulated and validated in 3 weeks at a fixed price. [Ask here](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#ask) or write to [info@botshare.ai](mailto:info@botshare.ai).
+- **OpenArm 2.0 Mobile Integration Sprint:** your gripper, tool or use case on the combined model, simulated and validated in 3 weeks at a fixed price. [Ask here](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#ask).
 
 OpenArm 2.0 components come from the official [OpenArm](https://github.com/enactic/openarm) packages under their own licences. Keep their notices in forks.
 
