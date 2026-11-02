@@ -1,17 +1,125 @@
-# openamr-upperbody-sw
+# OpenAMRobot 2.0: open-source mobile base with lift for OpenArm 2.0 dual arms
 
-Upper-body software for OpenAMRobot 2.0: the combined mobile base, lift column and OpenArm 2.0 arms.
+![OpenAMRobot 2.0 visualization (assembled, lift raised)](docs/media/hero.png)
+
+*OpenAMRobot 2.0 visualization (assembled, lift raised).*
+
+The combined model puts the mobile base, a 350 mm lift and two OpenArm 2.0 arms in one URDF/Xacro, with MoveIt and Gazebo, ready to fork.
+It is built for makers, developers, startups and labs taking OpenArm 2.0 mobile.
+
+From the team behind [openamr-platform-sw](https://github.com/openAMRobot/openamr-platform-sw).
+
+## Status
+
+The combined model is here: mobile base, 350 mm lift and two OpenArm 2.0 arms in one URDF, running with MoveIt and Gazebo (verification: [`docs/verification.md`](docs/verification.md)).
+The physical build is underway.
+Platform release v2.0.0-rc.1 lands 20 Nov 2026, the dual-arm hardware follows.
+
+Interactive 3D model: https://docs.openamrobot.ai/assets/roadmap/robot.html
+
+## Model and design figures
+
+These are design values from the model, not measurements of a built robot.
+
+| Figure | Design value |
+|---|---|
+| Shoulder height | 1.00 to 1.35 m |
+| Lift travel | 350 mm |
+| Maximum assembled height | 1.7 m |
+
+## Prerequisites
+
+- Ubuntu 24.04
+- ROS 2 Jazzy
+
+The workspace is `~/openamr_ws`. Its `src/` holds this repository, `openamr-platform-sw` and the two OpenArm repositories under `src/upstream/`, each at the commit pinned in [`upstream_pins.yaml`](ros2/src/openamrobot_upperbody_description/config/upstream_pins.yaml).
+This is the layout CI uses ([`.github/workflows/model-tests.yml`](.github/workflows/model-tests.yml)).
+
+```bash
+mkdir -p ~/openamr_ws/src/upstream
+cd ~/openamr_ws/src
+git clone https://github.com/openAMRobot/openamr-upperbody-sw.git
+git clone https://github.com/openAMRobot/openamr-platform-sw.git
+git -C openamr-platform-sw checkout 131e500fc4e5afc9f648cbd7dbf5b416280761fb
+git clone https://github.com/enactic/openarm_description.git upstream/openarm_description
+git -C upstream/openarm_description checkout 14ff67b638ff1c738a1b9a6be8aaa5ce5ed2c831
+git clone https://github.com/enactic/openarm_ros2.git upstream/openarm_ros2
+git -C upstream/openarm_ros2 checkout 4e837e1d0dae692ff67b560b69d8d281d7a8d4ed
+```
+
+The commits above are the pins at the time of writing. If they differ, `upstream_pins.yaml` wins.
+
+Install the dependencies of the packages the model needs, as CI does:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd ~/openamr_ws
+rosdep install --rosdistro jazzy --ignore-src -y --from-paths $(colcon list --base-paths src --paths-only --packages-up-to openamrobot_upperbody_description openamrobot_upperbody_control openamrobot_upperbody_gazebo openamrobot_upperbody_moveit openamrobot_upperbody_bringup)
+```
+
+Build, as in [`docs/verification.md`](docs/verification.md#run-it):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+cd ~/openamr_ws
+colcon build --symlink-install --packages-skip openarm_hardware openarm
+source install/setup.bash
+```
+
+## Three ways in
+
+![The actual combined URDF in RViz at full lift (L1350)](docs/media/urdf_rviz_L1350.png)
+
+*The actual combined URDF in RViz at full lift (L1350). This is what the commands below load.*
+
+Run each command from a shell where the workspace is sourced.
+
+### 1. View the robot
+
+RViz with joint sliders. Use it to check the geometry.
+
+```bash
+ros2 launch openamrobot_upperbody_bringup view.launch.py
+```
+
+### 2. Try motion planning
+
+MoveIt on mock hardware, with RViz.
+
+```bash
+ros2 launch openamrobot_upperbody_bringup moveit.launch.py sim:=mock rviz:=true
+```
+
+### 3. Run the simulation
+
+MoveIt in Gazebo, with RViz.
+
+```bash
+ros2 launch openamrobot_upperbody_bringup moveit.launch.py sim:=gazebo rviz:=true physics_engine:=gz-physics-bullet-featherstone-plugin
+```
+
+Work in progress: the grippers may not close on the default DART engine. Known issues: [Gazebo server teardown](docs/issues/gz-sim_server_teardown_segfault_and_hang.md) and [ros_gz bridge teardown](docs/issues/ros_gz-bridge_teardown_segfault.md).
+
+## Build one or get help
+
+- **Hardware:** [openamr-platform-hw](https://github.com/openAMRobot/openamr-platform-hw)
+- **Packages and current prices:** [botshare.ai/openamrobot](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#products). First dispatch April 2027.
+- **OpenArm 2.0 Mobile Integration Sprint:** your gripper, tool or use case on the combined model, simulated and validated in 3 weeks at a fixed price. [Ask here](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#ask) or write to [info@botshare.ai](mailto:info@botshare.ai).
+
+OpenArm 2.0 components come from the official [OpenArm](https://github.com/enactic/openarm) packages under their own licences. Keep their notices in forks.
+
+## Engineering details
 
 > **Status:** Development. `openamrobot_upperbody_description` provides the option B upper-body description and its tests. The combined base + upper body + arm model (option B's lift model on platform-sw's `base_footprint`, two OpenArm v2.0 arms rooted on its mount frames), the `ros2_control` profiles, the Gazebo, MoveIt and bringup packages and their verification are implemented and verified in simulation and on mock hardware only: see [`docs/verification.md`](docs/verification.md) and the package READMEs. Nothing here is a hardware result.
 
-## What lives here
+### What lives here
 - **Combined description:** base + lift column + arm profile + arms in one URDF/Xacro, using the official OpenArm arm-mount frames.
 - **MoveIt:** arm planning groups and collision configuration on the combined model, with the lift as a planned joint.
 - **Bringup:** launch files composing the base, upper body and arm integration from `openamrobot-manipulation`.
 - **Configuration metadata:** selected configuration IDs, model/configuration identity and calibration references.
 - **Lift control integration:** the lift height is joint state of `lift_joint`; the lift driver and its interlocks are owned by the firmware and safety work packages.
 
-## Current development scope
+### Current development scope
 1. Combined URDF/Xacro with a correct TF tree, collision geometry and documented mounting transforms.
 2. Arm simulation through ros2_control, followed by physical integration under the approved work packages and acceptance gates.
 3. MoveIt planning and execution on the combined model.
@@ -19,7 +127,7 @@ Upper-body software for OpenAMRobot 2.0: the combined mobile base, lift column a
 
 Simulation is an integration stage, not a blanket deferral of physical OpenAMRobot 2.0 work. Model, simulation and hardware acceptance must be recorded separately.
 
-## Upper-body configuration (option B)
+### Upper-body configuration (option B)
 Decision of record: P-03 revision 18.9 item 18, 9 October 2026. Heights are from the floor (Z = 0); x forward, y left, z up.
 
 | Item | Value |
@@ -37,7 +145,7 @@ Configuration IDs: `column` (`dold_v4_350`, `tl3_400`), `base_plate` (`bp000`, `
 
 Every configuration ID must stay consistent across URDF/Xacro, MoveIt, TF/camera calibration, the robot configuration hash and dataset metadata. Changing a configuration ID requires the affected calibration and readiness checks.
 
-### Description package
+#### Description package
 `ros2/src/openamrobot_upperbody_description`:
 
 | Path | Purpose |
@@ -62,7 +170,7 @@ colcon test-result --verbose --test-result-base build/openamrobot_upperbody_desc
 ros2 launch openamrobot_upperbody_description upperbody_description.launch.py base_plate:=bp050 head_pitch:=hp25
 ```
 
-## Depends on
+### Depends on
 - `openamr-platform-sw`: mobile-base model (`base_footprint`, `base_link`) and software.
 - `openamrobot-manipulation`: arm integration and manipulation server.
 - `openamr-upperbody-hw`: lift, base plate, arm profile geometry, mounting interfaces and as-built measurements.
