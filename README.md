@@ -109,7 +109,7 @@ Work in progress: the grippers may not close on the default DART engine. Known i
 ## Build one or get help
 
 - **Hardware:** [openamr-platform-hw](https://github.com/openAMRobot/openamr-platform-hw)
-- **Packages and current prices:** [botshare.ai/openamrobot](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#products). First dispatch April 2027.
+- **Packages and current prices:** [botshare.ai/openamrobot](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#products). Planned delivery from April 2027; some assembled units may ship earlier, from the end of January 2027.
 - **OpenArm 2.0 Mobile Integration Sprint:** your gripper, tool or use case on the combined model, simulated and validated in 3 weeks at a fixed price. [Ask here](https://botshare.ai/openamrobot?utm_source=github&utm_medium=readme#ask).
 
 OpenArm 2.0 components come from the official [OpenArm](https://github.com/enactic/openarm) packages under their own licences. Keep their notices in forks.
