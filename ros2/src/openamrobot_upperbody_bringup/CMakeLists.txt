@@ -44,6 +44,14 @@ if(BUILD_TESTING)
   # M07 (P17): at rest in Gazebo no joint sits within the joint_rest_margin_rad datum of a limit. Starts its own headless server like M02,
   # on its own domain and partition; FAILs by design while the right finger rests on its open limit.
   add_launch_test(test/test_m07_rest_position_margin.py TARGET m07_rest_position_margin TIMEOUT 300)
+  # L02 (#44): the lift guard's acceptance on mock, black box through /lift_guard/status, list_controllers and lift_joint on /joint_states.
+  # Its own ROS_DOMAIN_ID like L01; on main before the guard it FAILs by design (the red half of the #44 integration branch).
+  add_launch_test(test/test_l02_lift_guard_mock.py TARGET l02_lift_guard_mock TIMEOUT 600)
+  # L03 (#44 acceptance 1): the guard is killed during an allowed lift move on mock; time to deactivation and to standstill, hold, no replay.
+  add_launch_test(test/test_l03_lift_guard_kill_mock.py TARGET l03_lift_guard_kill_mock TIMEOUT 300)
+  # G03 (#44): the guard in Gazebo (bullet-featherstone, like M02): raw /arm/joint_states vs the merge, a driven base, the lift read from the
+  # simulator's own carriage pose. Own ROS_DOMAIN_ID and GZ_PARTITION.
+  add_launch_test(test/test_g03_lift_guard_gazebo.py TARGET g03_lift_guard_gazebo TIMEOUT 900)
 endif()
 
 ament_package()
