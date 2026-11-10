@@ -112,6 +112,8 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
         self.case(name, controller_active_before_first_ok=[round(t - tl.controller[0][0], 2) for t in active_before][:5],
                   arm_deviation_at_first_ok=devs[-1] if devs else None,
                   lift_motion_before_first_ok=(max(lift0) - min(lift0)) if lift0 else None)
+        # Without an observation before the first OK, 'never active before it' would pass vacuously (seen once, 10 Nov, double run).
+        self.assertTrue(any(t < t_ok for t, _ in tl.controller), f"{LIFT_CONTROLLER}'s state was never observed before the first OK")
         self.assertFalse(active_before, f"{LIFT_CONTROLLER} was active before the guard first allowed the lift (#44 acceptance 1: it "
                                         "starts inactive)")
         self.assertTrue(devs and max(devs[-1].values()) <= self.tol, f"first allowed with an arm out of park: {devs[-1] if devs else None}")

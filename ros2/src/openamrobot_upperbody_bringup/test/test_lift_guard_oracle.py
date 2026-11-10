@@ -89,10 +89,37 @@ def test_p3_a_slow_reaction_is_found():
 
 
 def test_p4_status_contract_breaches_are_found():
-    tl = Timeline(end=1.0, status=[(0.0, OK, "active", ("BASE_MOVING",)), (0.1, ERROR, "inactive", ()),
+    tl = Timeline(end=1.0, status=[(0.0, OK, "active", ("BASE_MOVING",)), (0.1, ERROR, "active", ()),
                                    (0.2, 1, "inactive", ("BASE_MOVING",)), (0.3, ERROR, "inactive", ("SOMETHING_NEW",)),
                                    (0.4, ERROR, "sleeping", ("BASE_MOVING",))])
     assert len(evaluate(tl, **ARGS)["P4_status_contract"]) == 5
+
+
+def test_p6_error_without_a_code_asks_nothing_of_the_controller():
+    """PR #53 run (L03 idle): the spawner activated lift_controller while the guard said 'nothing blocks, not active yet'."""
+    tl = Timeline(end=5.0, status=[(1.0, ERROR, "inactive", ()), (2.0, ERROR, "inactive", ()), (2.1, OK, "active", ())],
+                  controller=[(0.0, "inactive"), (1.5, "active")])
+    assert evaluate(tl, **ARGS)["P6_allowed_means_active"] == []
+
+
+def test_p6_error_with_a_code_while_active_beyond_the_lag_is_found():
+    tl = Timeline(end=5.0, status=[(1.0, ERROR, "inactive", ("BASE_MOVING",))], controller=[(0.0, "active")])
+    assert evaluate(tl, **ARGS)["P6_allowed_means_active"]
+
+
+def test_p1_motion_under_error_without_a_code_is_not_blocked_motion_but_p5_sees_the_misreport():
+    tl = Timeline(end=5.0, lift=[(t / 10, 0.1 + 0.001 * t) for t in range(0, 40)],
+                  status=[(0.0, ERROR, "inactive", ())], controller=[(0.0, "active")])
+    result = evaluate(tl, **ARGS)
+    assert result["P1_no_motion_while_blocked"] == []
+    assert result["P5_status_matches_controller"]
+
+
+def test_p4_error_without_a_code_while_inactive_is_the_activation_in_progress():
+    """PR #53: nothing blocks, the guard has asked for the switch, lift_controller is not listed active yet."""
+    tl = Timeline(end=1.0, status=[(0.0, ERROR, "inactive", ("BASE_MOVING",)), (0.1, ERROR, "inactive", ()), (0.2, OK, "active", ())],
+                  controller=[(0.0, "inactive"), (0.15, "active")])
+    assert evaluate(tl, **ARGS)["P4_status_contract"] == []
 
 
 def test_p5_status_disagreeing_with_the_manager_beyond_the_lag_is_found():

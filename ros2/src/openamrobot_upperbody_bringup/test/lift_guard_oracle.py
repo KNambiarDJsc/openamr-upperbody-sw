@@ -80,7 +80,9 @@ def _value_at(events, t, index=1, default=None):
 
 
 def no_motion_while_blocked(tl, settle, eps):
-    blocked = shrink(step_intervals(tl.status, lambda e: e[1] != OK, tl.end), settle)
+    # Blocked = a status with a blocking code. ERROR with no code is "allowed, lift_controller not active yet" (PR #53); P5 covers a guard
+    # that reports that while the controller is in fact active.
+    blocked = shrink(step_intervals(tl.status, lambda e: e[1] != OK and len(e[3]) > 0, tl.end), settle)
     return [{"property": "P1", "from": a, "to": b, "moved_m": m, "case": label_at(tl, a)}
             for a, b in blocked for m in [lift_motion(tl.lift, a, b)] if m > eps]
 
@@ -125,8 +127,12 @@ def status_contract(tl, known_codes):
         problems = []
         if level not in (OK, ERROR):
             problems.append(f"level {level} is neither OK nor ERROR")
-        if (level == OK) != (len(codes) == 0):
-            problems.append(f"level {level} with blocking codes {list(codes)}")
+        if level == OK and codes:
+            problems.append(f"OK with blocking codes {list(codes)}")
+        # ERROR with no code is the guard's "nothing blocks, lift_controller not active yet" (PR #53 build_status): legitimate only while
+        # it reports lift_controller inactive. A guard stuck there fails the cases (wait_allowed), not this property.
+        if level == ERROR and not codes and ctl != "inactive":
+            problems.append(f"ERROR with no blocking code while lift_controller is reported {ctl!r}")
         unknown = [c for c in codes if c not in known_codes]
         if unknown:
             problems.append(f"unknown codes {unknown}")
@@ -155,7 +161,8 @@ def status_matches_controller(tl, lag):
 
 
 def allowed_means_active(tl, lag):
-    """P6: OK must come with lift_controller active, ERROR with it inactive, apart from transitions shorter than `lag`."""
+    """P6: OK must come with lift_controller active, ERROR with a blocking code with it inactive, apart from transitions shorter than `lag`.
+    ERROR with no code (allowed, not active yet) asks nothing of the controller: an activation the guard has not seen yet is not a breach."""
     def reached(t, want_active):
         """lift_controller was in the wanted state at t, or got there at some moment in (t, t + lag]."""
         def ok(state):
@@ -166,7 +173,7 @@ def allowed_means_active(tl, lag):
     for t, level, ctl, codes in tl.status:
         if level == OK and not reached(t, True):
             out.append({"property": "P6", "at": t, "status": "OK", "controller": _value_at(tl.controller, t + lag), "case": label_at(tl, t)})
-        if level == ERROR and not reached(t, False):
+        if level == ERROR and codes and not reached(t, False):
             out.append({"property": "P6", "at": t, "status": "ERROR", "controller": _value_at(tl.controller, t + lag), "case": label_at(tl, t)})
     return out
 

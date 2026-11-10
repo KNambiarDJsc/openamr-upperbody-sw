@@ -141,7 +141,10 @@ class GuardProbe:
         self.joints, self.joint_t = {}, {}
         self.status, self.status_t, self.status_count = None, None, 0
         self.status_changes = []                    # (t, parsed) on every change of (ok, controller, blocking)
-        self.ctl_state = None
+        self.ctl_state, self.ctl_event_t = None, None
+        self.ctl_counts = {"activity_events": 0, "polls_applied": 0, "polls_dropped": 0, "polls_without_lift": 0}
+        self.t_created = time.monotonic()
+        self.receipt_lags = []                      # s between a JointState's stamp and its receipt here (mock only)
         self.params, self.params_source = dict(PROVISIONAL), "provisional (guard parameters not read yet)"
         self.state_timeout = PROVISIONAL["state_timeout_s"]
 
@@ -174,7 +177,16 @@ class GuardProbe:
         return {side: arm_deviation(fresh, self.park, ARM_JOINTS[side]) for side in ARM_JOINTS}
 
     def _on_joints(self, msg):
-        now = time.monotonic()
+        """Each sample is placed at the moment it was MEASURED, not when this process got to it. The guard decides from the same samples,
+        so a backlog here (a loaded runner, the status topic served first) must not make the oracle see a status before the sample that
+        caused it (PR #53 run, 10 Nov: P3 flagged a status the guard issued 71 ms after it had seen the arm back in tolerance). The stamp is
+        on the system clock in mock; Gazebo stamps are sim time, and receipt time is used there."""
+        recv_mono, recv_wall = time.monotonic(), time.time()
+        lag = recv_wall - (msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
+        now = recv_mono
+        if 0.0 <= lag <= 2.0:
+            now = recv_mono - lag
+            self.receipt_lags.append(lag)
         with self.lock:
             for n, p in zip(msg.name, msg.position):
                 self.joints[n] = p
@@ -194,8 +206,16 @@ class GuardProbe:
             if prev is None or (parsed["ok"], parsed["controller"], parsed["blocking"]) != (prev["ok"], prev["controller"], prev["blocking"]):
                 self.status_changes.append((now, parsed))
 
-    def _set_ctl(self, state, now):
+    def _set_ctl(self, state, now, polled_since=None):
+        """`polled_since`: a list_controllers answer to a request sent then. It is dropped if an activity event arrived after the request:
+        the answer may describe the manager before that event (PR #53 run, 10 Nov: a stale 'inactive' landed after the activation event)."""
         with self.lock:
+            if polled_since is not None and self.ctl_event_t is not None and self.ctl_event_t >= polled_since:
+                self.ctl_counts["polls_dropped"] += 1
+                return
+            self.ctl_counts["activity_events" if polled_since is None else "polls_applied"] += 1
+            if polled_since is None:
+                self.ctl_event_t = now
             if state != self.ctl_state:
                 self.ctl_state = state
                 self.tl.controller.append((now, state))
@@ -206,16 +226,22 @@ class GuardProbe:
                 self._set_ctl(c.state.label, time.monotonic())
 
     def _poll(self):
-        """5 Hz: lift_controller's state from the manager (a backstop for activity events missed at start-up), and an arm sample, so that
-        arm state going silent shows up in the timeline as unreadable (deviation inf) instead of as the last value forever."""
+        """5 Hz: lift_controller's state from the manager (a backstop for activity events missed at start-up), and, when arm state has gone
+        silent, an arm sample, so that it shows up in the timeline as unreadable (deviation inf) instead of as the last value forever. A
+        readable sample is not added here: it would place old joint values at the current time."""
         while not self._stop.is_set():
+            t_req = time.monotonic()
             state = self.controller_states(timeout=1.0).get(LIFT_CONTROLLER)
             if state is not None:
-                self._set_ctl(state, time.monotonic())
+                self._set_ctl(state, time.monotonic(), polled_since=t_req)
+            else:
+                self.ctl_counts["polls_without_lift"] += 1
             now = time.monotonic()
             with self.lock:
                 if self.joints:
-                    self.tl.arms.append((now, self._deviations(now)))
+                    devs = self._deviations(now)
+                    if any(math.isinf(v) for v in devs.values()):
+                        self.tl.arms.append((now, devs))
             self._stop.wait(0.2)
 
     def mark(self, label):
@@ -224,7 +250,7 @@ class GuardProbe:
 
     def timeline(self):
         with self.lock:
-            tl = Timeline(lift=list(self.tl.lift), arms=sorted(self.tl.arms, key=lambda e: e[0]), status=list(self.tl.status),
+            tl = Timeline(lift=sorted(self.tl.lift, key=lambda e: e[0]), arms=sorted(self.tl.arms, key=lambda e: e[0]), status=list(self.tl.status),
                           controller=list(self.tl.controller), marks=list(self.tl.marks))
         tl.end = time.monotonic()
         return tl
@@ -309,7 +335,7 @@ class GuardProbe:
 
     def blocked(self, code=None, any_of=None):
         s = self.current_status()
-        if s is None or s["ok"]:
+        if s is None or s["ok"] or not s["blocking"]:    # ERROR with no code = allowed, lift_controller not active yet (PR #53)
             return False
         if code is not None and code not in s["blocking"]:
             return False
@@ -562,6 +588,12 @@ class GuardCase:
         ok = bool(cases) and all(c.get("ok") for c in cases.values())
         cls.record["status_changes"] = [{"t": round(t - cls.p.status_changes[0][0], 3), **s} for t, s in cls.p.status_changes][:400] \
             if cls.p.status_changes else []
+        lags = sorted(cls.p.receipt_lags)
+        t0 = cls.p.status_changes[0][0] if cls.p.status_changes else cls.p.t_created
+        cls.record["controller_recording"] = {**cls.p.ctl_counts, "probe_created_s": round(cls.p.t_created - t0, 3),
+                                              "first_entries": [(round(t - t0, 3), st) for t, st in cls.p.tl.controller[:12]]}
+        cls.record["arm_state_receipt_lag_s"] = {"samples": len(lags), "p50": round(lags[len(lags) // 2], 4), "p99": round(lags[int(len(lags) * 0.99)], 4),
+                                                 "max": round(lags[-1], 4)} if lags else None
         write_run_sidecar(cls.CHECK_ID, cls.SLUG, cls.NAME, "PASS" if ok else "FAIL", jsonable(cls.record))
         cls.p.close()
         rclpy.shutdown()
