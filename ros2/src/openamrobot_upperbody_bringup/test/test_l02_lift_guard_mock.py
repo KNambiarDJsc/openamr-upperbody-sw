@@ -1,33 +1,39 @@
 # SPDX-License-Identifier: MIT
-"""L02 (#44): on `mock`, the lift moves only while both arms are stowed, their state is fresh and the base reports stopped; otherwise
-lift_controller is inactive and no command path moves the lift.
+"""L02 (#44): the lift guard on `mock`: the arms, the controller and the guard's own contract.
 
-Black box: the stack is `moveit.launch.py sim:=mock`, with the lift guard however it is built. The test reads the guard's status
-(/lift_guard/status), lift_controller's state (/controller_manager/list_controllers) and lift_joint on /joint_states, and commands the lift
-through both of its paths (the FollowJointTrajectory action and the /lift_controller/joint_trajectory topic). It never reads an action result as
-evidence of motion (#44 acceptance 4, #49).
+Black box. The stack is `moveit.launch.py sim:=mock` (or LIFT_GUARD_STACK_LAUNCH), with the guard however it is built. The test reads
+/lift_guard/status, lift_controller's state (/controller_manager/activity, list_controllers), lift_joint and the arm joints on /joint_states,
+and the guard's own parameters; it commands the lift through the action, the topic and MoveIt. An action result is never evidence of motion.
 
-Cases, in order (each one leaves both arms in park and the guard reporting OK for the next):
-  1  the guard starts blocked, then allows once the start-up has put both arms in park; the lift has not moved on its own
-  2  allowed: a lift goal moves the lift (the positive control: without it every "did not move" below could pass on a dead stack)
-  3  left arm out of park: blocked with ARM_NOT_STOWED_LEFT; the action goal is rejected and a topic trajectory does not move the lift;
-     after the arm is parked again the topic trajectory is not replayed
-  4  activating lift_controller from outside while blocked: the guard deactivates it again
-  5  an arm trajectory still running within the pose tolerance: blocked with ARM_TRAJECTORY_ACTIVE_LEFT (not a momentary zero velocity)
-  6  the arm leaves park during a lift move: the goal ends, the lift stops and holds, and nothing resumes when the arm is parked again
-  7  arm joint state stops (joint_state_broadcaster deactivated): blocked with ARM_STATE_STALE or ARM_STATE_MISSING
-  8  /odom reports the base moving: blocked with BASE_MOVING
-  9  /odom stops: ODOM_STALE or ODOM_MISSING (skipped until the mock odom stub can be turned off; question on #44)
+Every case starts from the same state (both arms in park, lift at 0.10 m, guard asked to allow) and checks the physical outcome before the
+guard's report, so that on main (no guard) each case fails because the lift MOVED. The last test checks the run-wide safety properties
+(lift_guard_oracle) over everything recorded, so a guard that allows the lift for a moment anywhere in the run fails even where no case looks.
 
-The thresholds come from the design's provisional defaults (lift_guard_support.PROVISIONAL); the firmware values (#20) replace them.
+Cases
+  00 start-up: blocked first; lift_controller never active before the first OK; both arms in park and the lift unmoved when first allowed
+  01 status contract: name, keys, publisher QoS (reliable, transient local), rate within 25 % of status_rate_hz
+  02 positive controls: the action and the topic both move the lift while allowed (without them every "did not move" is vacuous)
+  03 each of the 14 arm joints alone, out of park by 3x the tolerance: blocked with that arm's code, the action goal rejected
+  04 the tolerance boundary, from the guard's own stowed_tolerance: 0.8x stays allowed and the lift moves; 1.2x blocks
+  05 a trajectory still running INSIDE the tolerance (reference faster than reference_velocity_max): blocked, both arms
+  06 an arm goal executing but holding still (zero velocity, at park): blocked (the action condition alone sees it)
+  07 an arm trajectory sent on the controller's TOPIC: blocked (no action exists, only the reference check sees it)
+  08 arm out: the action is rejected, the topic does not move the lift up or down, and nothing replays after the arm is parked again
+  09 lift_controller activated from outside while blocked: deactivated again within the reaction budget; lift travel bounded
+  10 an arm leaves park during a lift move, up (left) and down (right): the lift stops within the travel budget, holds, does not resume
+  11 arm state stops (joint_state_broadcaster deactivated): blocked with ARM_STATE_STALE or ARM_STATE_MISSING
+  12 injected arm state: fresh and parked allows; one joint absent from every message blocks (freshness per joint); a NaN blocks
+  13 MoveIt: a lift request through move_group with an arm out does not move the lift
+  14 two reasons at once: both arms out gives both codes; parking one leaves the other
+  zz the safety properties P1-P6 held over the whole run
 
-On main before the guard exists this test FAILs, by design: it is the red half of the integration branch (#44). Simulation only: it says
-nothing about the firmware interlock (CTL-017).
+On main before the guard exists this FAILs by design (the red half of the #44 integration branch). Simulation only: it says nothing about
+the firmware interlock (CTL-017).
 """
+import math
 import os
 import random
 import sys
-import threading
 import time
 import unittest
 
@@ -39,17 +45,15 @@ import launch_testing  # noqa: E402
 import launch_testing.actions  # noqa: E402
 import pytest  # noqa: E402
 import rclpy  # noqa: E402
-from ament_index_python.packages import get_package_share_directory  # noqa: E402
-from launch.launch_description_sources import PythonLaunchDescriptionSource  # noqa: E402
-from nav_msgs.msg import Odometry  # noqa: E402
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy, write_run_sidecar  # noqa: E402
-from lift_guard_support import (ALLOW_WITHIN_S, ARM_JOINTS, BLOCK_WITHIN_S, INTERFACE, LIFT_CONTROLLER, PROVISIONAL, GuardProbe,  # noqa: E402
-                                lift_still_m, max_excursion, park_of, srdf_states)
+from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # noqa: E402
+from lift_guard_oracle import first_crossing  # noqa: E402
+from lift_guard_support import (ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, LIFT, LIFT_CONTROLLER, START_HEIGHT, GuardCase,  # noqa: E402
+                                joint_limits, lift_still_m, stack_under_test)
 
 PROFILE = "mock"
-STARTUP_WITHIN_S = 120.0
 EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["process_pattern"]]
 
 
@@ -57,247 +61,377 @@ EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "
 def generate_test_description():
     if not A7_ENABLED:
         return launch.LaunchDescription([launch.actions.ExecuteProcess(cmd=["sleep", "30"]), launch_testing.actions.ReadyToTest()]), {}
-    moveit = os.path.join(get_package_share_directory("openamrobot_upperbody_bringup"), "launch", "moveit.launch.py")
-    return launch.LaunchDescription([
-        launch.actions.IncludeLaunchDescription(PythonLaunchDescriptionSource(moveit),
-                                                launch_arguments={"sim": PROFILE, "rviz": "false"}.items()),
-        launch_testing.actions.ReadyToTest(),
-    ]), {}
+    stack, _ = stack_under_test(PROFILE)
+    return launch.LaunchDescription([stack, launch_testing.actions.ReadyToTest()]), {}
 
 
 @unittest.skipUnless(A7_ENABLED, SKIP_REASON)
-class TestLiftGuardMock(unittest.TestCase):
-    record = {"profile": PROFILE, "interface": INTERFACE, "provisional": PROVISIONAL,
-              "budgets_s": {"block_within": BLOCK_WITHIN_S, "allow_within": ALLOW_WITHIN_S}, "cases": {}}
+class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
+    PROFILE = PROFILE
+    NODE = "l02_lift_guard"
+    CHECK_ID, SLUG, NAME = "L02", "lift_guard_arms_mock", "#44 lift guard on mock: arms, controller, contract"
 
     @classmethod
     def setUpClass(cls):
-        rclpy.init()
-        cls.p = GuardProbe(PROFILE, "l02_lift_guard")
-        cls.states = srdf_states()
-        cls.park = {s: park_of(cls.states, s) for s in ARM_JOINTS}
-        cls.out = list(cls.park["left"])
-        cls.out[3] = 1.5                       # left joint4 to 1.5 rad: SRDF hands_up's elbow, far outside any stowed tolerance
+        super().setUpClass()
+        cls.limits = joint_limits()
 
-    @classmethod
-    def tearDownClass(cls):
-        cases = cls.record["cases"]
-        ok = bool(cases) and all(c.get("ok") for c in cases.values())
-        cls.record["status_log"] = [{"t": round(t - cls.p.status_log[0][0], 3), **s} for t, s in cls.p.status_log] if cls.p.status_log else []
-        write_run_sidecar("L02", "lift_guard_mock", "#44 lift guard acceptance on mock", "PASS" if ok else "FAIL", cls.record)
-        cls.p.close()
-        rclpy.shutdown()
+    def out_pose(self, side, joint=None, offset=None):
+        """Park with one joint moved by `offset` (default 3x the tolerance), away from that joint's nearer limit."""
+        joint = joint or f"openarm_{side}_joint4"
+        pose = self.p.park_side(side)
+        i = ARM_JOINTS[side].index(joint)
+        offset = 3 * self.tol if offset is None else offset
+        lo, hi = self.limits[joint]
+        pose[i] += offset if pose[i] + offset <= hi - 1e-3 else -offset
+        assert lo <= pose[i] <= hi, f"{joint}: {pose[i]} outside [{lo}, {hi}]"
+        return pose
 
-    # ---- helpers ----------------------------------------------------------------------------------------------------------------------
-    def case(self, name, **fields):
-        self.record["cases"].setdefault(name, {"ok": False}).update(fields)
+    def far_out(self, side):
+        """An unmistakably engaged arm: joint4 at 1.5 rad (SRDF hands_up's elbow)."""
+        pose = self.p.park_side(side)
+        pose[3] = 1.5
+        return pose
 
-    def passed(self, name):
-        self.record["cases"][name]["ok"] = True
+    # ---- 00 start-up ------------------------------------------------------------------------------------------------------------------
+    def test_l02_00_starts_blocked_and_allows_only_once_both_arms_are_parked(self):
+        name = "00_startup"
+        self.case(name)
+        self.assertTrue(self.joints_ok, "/joint_states never listed lift_joint and all 14 arm joints")
+        first_ok = self.p.wait_for(lambda: any(s["ok"] for _, s in self.p.status_changes), 30.0)
+        tl = self.p.timeline()
+        changes = list(self.p.status_changes)
+        self.case(name, first_status=changes[0][1] if changes else None)
+        self.assertTrue(changes, f"no message on {INTERFACE['status_topic']} since the launch")
+        self.assertFalse(changes[0][1]["ok"], f"the first status already allowed the lift: {changes[0][1]}")
+        self.assertIsNotNone(first_ok, "the guard never allowed the lift after start-up")
+        t_ok = next(t for t, s in changes if s["ok"])
+        active_before = [t for t, s in tl.controller if s == "active" and t < t_ok - 0.05]
+        devs = [d for t, d in tl.arms if t <= t_ok]
+        lift0 = [p for t, p in tl.lift if t <= t_ok]
+        self.case(name, controller_active_before_first_ok=[round(t - tl.controller[0][0], 2) for t in active_before][:5],
+                  arm_deviation_at_first_ok=devs[-1] if devs else None,
+                  lift_motion_before_first_ok=(max(lift0) - min(lift0)) if lift0 else None)
+        self.assertFalse(active_before, f"{LIFT_CONTROLLER} was active before the guard first allowed the lift (#44 acceptance 1: it "
+                                        "starts inactive)")
+        self.assertTrue(devs and max(devs[-1].values()) <= self.tol, f"first allowed with an arm out of park: {devs[-1] if devs else None}")
+        self.assertTrue(not lift0 or max(lift0) - min(lift0) <= lift_still_m(PROFILE), "the lift moved during start-up")
+        self.passed(name)
 
-    def park_both(self):
-        for side in ARM_JOINTS:
-            self.p.arm_goal(side, self.park[side], seconds=2.0)
+    # ---- 01 status contract -----------------------------------------------------------------------------------------------------------
+    def test_l02_01_status_contract(self):
+        name = "01_status_contract"
+        self.start(name)
+        s = self.p.current_status()
+        self.assertIsNotNone(s, f"no status on {INTERFACE['status_topic']}")
+        qos = self.p.status_publisher_qos()
+        rate = self.p.status_rate(3.0)
+        want = float(self.params["status_rate_hz"])
+        self.case(name, status_name=s["name"], keys=s["keys"], publishers=[(n, int(d), int(r)) for n, d, r in qos], rate_hz=round(rate, 2))
+        self.assertEqual(s["name"], INTERFACE["status_name"])
+        for key in (INTERFACE["key_controller"], INTERFACE["key_blocking"]):
+            self.assertIn(key, s["keys"], f"status has no {key!r} value")
+        self.assertEqual(len(qos), 1, f"exactly one publisher expected on {INTERFACE['status_topic']}: {qos}")
+        self.assertEqual(qos[0][1], DurabilityPolicy.TRANSIENT_LOCAL, "status publisher is not transient-local")
+        self.assertEqual(qos[0][2], ReliabilityPolicy.RELIABLE, "status publisher is not reliable")
+        self.assertLessEqual(abs(rate - want), 0.25 * want, f"status at {rate:.1f} Hz, status_rate_hz is {want}")
+        self.passed(name)
 
-    def precondition_allowed(self):
-        """Whether the guard allowed the lift before a case started. Recorded, not asserted: on main (no guard) the case must still run its
-        physical check, so the red baseline fails because the lift MOVED, not because a status topic is missing."""
-        return self.p.wait_allowed() is not None
-
-    def assert_allowed(self, what):
-        took = self.p.wait_allowed()
-        self.assertIsNotNone(took, f"{what}: the guard did not allow the lift within {ALLOW_WITHIN_S:.1f} s "
-                                   f"(status {self.p.current_status()}, {LIFT_CONTROLLER} {self.p.lift_controller_state()})")
-        return took
-
-    def assert_blocked(self, what, code=None):
-        took = self.p.wait_blocked(code)
-        self.assertIsNotNone(took, f"{what}: not blocked{' with ' + code if code else ''} within {BLOCK_WITHIN_S:.1f} s "
-                                   f"(status {self.p.current_status()}, {LIFT_CONTROLLER} {self.p.lift_controller_state()})")
-        return took
-
-    def assert_lift_still(self, before, seconds, what):
-        worst = max_excursion(self.p.sample_lift(seconds), before)
-        self.assertLessEqual(worst, lift_still_m(PROFILE), f"{what}: lift_joint moved {worst:.4f} m (from {before:.4f})")
-        return worst
-
-    # ---- cases ------------------------------------------------------------------------------------------------------------------------
-    def test_l02_1_starts_blocked_then_allows_once_both_arms_are_parked(self):
-        self.case("1_startup")
-        self.assertTrue(self.p.wait_for_joints(STARTUP_WITHIN_S), "/joint_states never listed lift_joint and all 14 arm joints")
-        lift0 = self.p.lift()
-        got = self.p.wait_for(lambda: self.p.current_status() is not None, 30.0)
-        self.assertIsNotNone(got, f"no message on {INTERFACE['status_topic']} within 30 s of the joint states (transient-local QoS)")
-        first = self.p.status_log[0][1]
-        self.case("1_startup", first_status=first, lift_at_start=lift0)
-        # mock starts the arms at home (all zeros); the design moves them to park at start-up. Until that has happened the lift is blocked.
-        self.assertFalse(first["ok"] and first["controller"] == "active",
-                         f"the first status already allowed the lift before the arms were confirmed in park: {first}")
-        took = self.p.wait_allowed(STARTUP_WITHIN_S)
-        self.assertIsNotNone(took, f"the guard never allowed the lift after start-up (status {self.p.current_status()})")
-        for side in ARM_JOINTS:
-            for j, v in zip(ARM_JOINTS[side], self.park[side]):
-                self.assertAlmostEqual(self.p.joint(j), v, delta=PROVISIONAL["stowed_tolerance_rad"], msg=f"{j} not in park at start-up")
-        self.assertLessEqual(abs(self.p.lift() - lift0), lift_still_m(PROFILE), "the lift moved during start-up without a lift command")
-        self.case("1_startup", allowed_after_s=round(took, 2))
-        self.passed("1_startup")
-
-    def test_l02_2_allowed_a_lift_goal_moves_the_lift(self):
-        self.case("2_positive_control", allowed_before=self.precondition_allowed())
+    # ---- 02 positive controls ---------------------------------------------------------------------------------------------------------
+    def test_l02_02_while_allowed_both_command_paths_move_the_lift(self):
+        name = "02_positive_controls"
+        self.start(name)
         l0 = self.p.lift()
-        accepted, handle, seconds = self.p.lift_goal(l0 + 0.03)
-        self.assertTrue(accepted, "the lift goal was rejected while the guard reported OK")
-        self.p.result(handle, seconds + 15.0)
-        moved = self.p.lift() - l0
-        self.case("2_positive_control", lift_from=l0, moved_m=round(moved, 4))
-        self.assertGreater(moved, 0.025, f"allowed lift goal moved the lift only {moved:.4f} m of 0.03")
-        accepted, handle, seconds = self.p.lift_goal(l0)
-        self.p.result(handle, seconds + 15.0)
-        self.passed("2_positive_control")
+        accepted, status = self.p.lift_goal_and_wait(l0 + 0.03)
+        by_action = self.p.lift() - l0
+        self.p.lift_topic_command(l0, 2.5)
+        time.sleep(4.0)
+        by_topic = self.p.lift() - (l0 + by_action)
+        self.case(name, action_accepted=accepted, moved_by_action_m=round(by_action, 4), moved_by_topic_m=round(by_topic, 4))
+        self.assertTrue(accepted, "the lift goal was rejected while the guard allowed the lift")
+        self.assertGreater(by_action, 0.025, f"the allowed action moved the lift {by_action:.4f} m of 0.03")
+        self.assertLess(by_topic, -0.025, f"the allowed topic trajectory moved the lift {by_topic:.4f} m of -0.03")
+        self.passed(name)
 
-    def test_l02_3_arm_out_blocks_both_command_paths_and_nothing_replays(self):
-        self.case("3_arm_out", allowed_before=self.precondition_allowed())
-        self.p.arm_goal("left", self.out, seconds=2.0)
-        took = self.p.wait_blocked("ARM_NOT_STOWED_LEFT")
-        l0 = self.p.lift()
-        accepted, handle, seconds = self.p.lift_goal(l0 + 0.03)
-        if accepted:
+    # ---- 03 every joint ---------------------------------------------------------------------------------------------------------------
+    def test_l02_03_each_arm_joint_alone_out_of_park_blocks_with_its_arms_code(self):
+        name = "03_each_joint"
+        self.start(name)
+        rows, failures = [], []
+        for side in ARM_JOINTS:
+            for joint in ARM_JOINTS[side]:
+                self.p.mark(f"{name}:{joint}")
+                self.p.arm_goal(side, self.out_pose(side, joint), seconds=1.0)
+                took = self.p.wait_blocked(f"ARM_NOT_STOWED_{side.upper()}", timeout=self.b.pose_reaction)
+                t0 = time.monotonic()
+                accepted, handle, _ = self.p.lift_goal(self.p.lift() + 0.02)
+                time.sleep(0.6)
+                if accepted:
+                    handle.cancel_goal_async()
+                moved = self.p.lift_motion_since(t0)
+                rows.append({"joint": joint, "blocked_after_s": None if took is None else round(took, 3), "accepted": accepted,
+                             "moved_m": round(moved, 5)})
+                if took is None or accepted or moved > lift_still_m(PROFILE):
+                    failures.append(rows[-1])
+                self.p.arm_goal(side, self.p.park_side(side), seconds=1.0)
+                self.p.wait_allowed(self.b.allow_within)
+        self.case(name, rows=rows)
+        self.assertFalse(failures, f"{len(failures)} of 14 joints out of park did not block the lift: {failures}")
+        self.passed(name)
+
+    # ---- 04 tolerance boundary --------------------------------------------------------------------------------------------------------
+    def test_l02_04_the_tolerance_boundary_comes_from_the_guards_own_parameter(self):
+        name = "04_tolerance_boundary"
+        self.start(name)
+        rows = {}
+        for side in ARM_JOINTS:
+            joint = f"openarm_{side}_joint4"
+            self.p.arm_goal(side, self.out_pose(side, joint, 0.8 * self.tol), seconds=1.0)
+            time.sleep(0.5)
+            inside_ok = self.p.stays(lambda: (self.p.current_status() or {}).get("ok") and self.p.lift_controller_state() == "active", 1.5)
+            l0 = self.p.lift()
+            accepted, _ = self.p.lift_goal_and_wait(l0 + 0.01)
+            moved = self.p.lift() - l0
+            self.p.arm_goal(side, self.out_pose(side, joint, 1.2 * self.tol), seconds=1.0)
+            outside = self.p.wait_blocked(f"ARM_NOT_STOWED_{side.upper()}", timeout=self.b.pose_reaction)
+            rows[side] = {"inside_stays_allowed": inside_ok, "inside_goal_accepted": accepted, "inside_moved_m": round(moved, 4),
+                          "outside_blocked_after_s": outside}
+            self.p.arm_goal(side, self.p.park_side(side), seconds=1.0)
+            self.p.wait_allowed(self.b.allow_within)
+        self.case(name, tolerance=self.tol, rows=rows)
+        for side, r in rows.items():
+            self.assertIsNotNone(r["outside_blocked_after_s"], f"{side}: 1.2x the tolerance did not block")
+            self.assertTrue(r["inside_stays_allowed"], f"{side}: 0.8x the tolerance did not stay allowed")
+            self.assertTrue(r["inside_goal_accepted"] and r["inside_moved_m"] > 0.008, f"{side}: at 0.8x the lift did not move: {r}")
+        self.passed(name)
+
+    # ---- 05 running inside the tolerance ----------------------------------------------------------------------------------------------
+    def test_l02_05_a_trajectory_still_running_inside_the_tolerance_blocks(self):
+        name = "05_running_inside_tolerance"
+        self.start(name)
+        vmax = float(self.params["reference_velocity_max"])
+        offset = 0.8 * self.tol
+        seconds = max(1.0, offset / (3.0 * vmax))           # the reference moves at about 3x reference_velocity_max
+        rows = {}
+        for side in ARM_JOINTS:
+            n0 = len(self.p.status_changes)
+            accepted, handle = self.p.arm_goal(side, self.out_pose(side, f"openarm_{side}_joint1", offset), seconds=seconds, wait=False)
             self.p.result(handle, seconds + 10.0)
-        self.p.lift_topic_command(self.p.lift() + 0.03, 2.0)
-        worst = max_excursion(self.p.sample_lift(3.0), l0)
-        self.case("3_arm_out", blocked_after_s=took, action_accepted=accepted, worst_m=round(worst, 4))
-        # the physical check first, so that on main (no guard) this fails for the reason #44 exists
-        self.assertLessEqual(worst, lift_still_m(PROFILE), f"lift_joint moved {worst:.4f} m with the left arm out of park (action + topic)")
+            codes = sorted({c for _, s in self.p.status_changes[n0:] for c in s["blocking"]})
+            rows[side] = {"accepted": accepted, "seconds": round(seconds, 2), "codes_seen": codes}
+            self.p.arm_goal(side, self.p.park_side(side), seconds=seconds)
+            self.p.wait_allowed(self.b.allow_within)
+        self.case(name, rows=rows)
+        for side, r in rows.items():
+            self.assertIn(f"ARM_TRAJECTORY_ACTIVE_{side.upper()}", r["codes_seen"], f"{side}: a running trajectory inside the pose "
+                          "tolerance never blocked (#44 acceptance 2: not a momentary zero velocity)")
+        self.passed(name)
+
+    # ---- 06 executing but holding still -----------------------------------------------------------------------------------------------
+    def test_l02_06_an_arm_goal_executing_while_holding_still_blocks(self):
+        name = "06_executing_holding_still"
+        self.start(name)
+        park = self.p.park_side("left")
+        accepted, handle = self.p.arm_goal("left", None, wait=False, points=[(park, 2.0), (park, 5.0)])
+        took = self.p.wait_blocked("ARM_TRAJECTORY_ACTIVE_LEFT", timeout=self.b.pose_reaction + 0.5)
+        self.p.result(handle, 15.0)
+        released = self.p.wait_allowed(self.b.allow_within)
+        self.case(name, accepted=accepted, blocked_after_s=took, released_after_goal_s=released)
+        self.assertTrue(accepted)
+        self.assertIsNotNone(took, "a left-arm goal executing at park with zero velocity did not block (the action condition)")
+        self.assertIsNotNone(released, "the guard did not allow again after the goal finished")
+        self.passed(name)
+
+    # ---- 07 arm trajectory on the topic -----------------------------------------------------------------------------------------------
+    def test_l02_07_an_arm_trajectory_sent_on_the_controller_topic_blocks(self):
+        name = "07_arm_topic"
+        self.start(name)
+        vmax = float(self.params["reference_velocity_max"])
+        seconds = max(1.0, 0.8 * self.tol / (3.0 * vmax))
+        n0 = len(self.p.status_changes)
+        self.p.arm_topic_command("left", self.out_pose("left", "openarm_left_joint1", 0.8 * self.tol), seconds)
+        time.sleep(seconds + 0.5)
+        inside_codes = sorted({c for _, s in self.p.status_changes[n0:] for c in s["blocking"]})
+        self.p.arm_topic_command("left", self.far_out("left"), 1.5)
+        out = self.p.wait_blocked(any_of=("ARM_NOT_STOWED_LEFT", "ARM_TRAJECTORY_ACTIVE_LEFT"), timeout=self.b.pose_reaction + 1.5)
+        self.case(name, inside_tolerance_codes=inside_codes, far_out_blocked_after_s=out)
+        self.p.arm_goal("left", self.p.park_side("left"), seconds=2.0)
+        self.assertIsNotNone(out, "an arm trajectory to hands_up sent on /left_arm_controller/joint_trajectory did not block")
+        self.assertIn("ARM_TRAJECTORY_ACTIVE_LEFT", inside_codes, "a topic trajectory running inside the tolerance did not block: only the "
+                      "controller's reference can see it (#44 design, condition 1)")
+        self.passed(name)
+
+    # ---- 08 both paths, no replay -----------------------------------------------------------------------------------------------------
+    def test_l02_08_arm_out_blocks_both_command_paths_and_nothing_replays(self):
+        name = "08_both_paths"
+        self.start(name)
+        self.p.arm_goal("left", self.far_out("left"), seconds=1.5)
+        took = self.p.wait_blocked("ARM_NOT_STOWED_LEFT", timeout=self.b.pose_reaction)
+        accepted, t0 = self.try_lift_both_paths(0.03)
+        moved = self.p.lift_motion_since(t0)
+        self.case(name, blocked_after_s=took, action_accepted=accepted, moved_m=round(moved, 5))
+        self.assertLessEqual(moved, lift_still_m(PROFILE), f"the lift moved {moved:.4f} m with the left arm out (action + topic)")
         self.assertFalse(accepted, "lift_controller accepted a goal with the left arm out of park")
-        self.assertIsNotNone(took, f"not blocked with ARM_NOT_STOWED_LEFT within {BLOCK_WITHIN_S:.1f} s: {self.p.current_status()}")
-        self.p.arm_goal("left", self.park["left"], seconds=2.0)
-        self.assert_allowed("after parking the left arm again")
-        replay = self.assert_lift_still(l0, 4.0, "after re-activation (no replay of the topic trajectory)")
-        self.case("3_arm_out", replay_worst_m=replay)
-        self.passed("3_arm_out")
+        self.assertIsNotNone(took, "not blocked with ARM_NOT_STOWED_LEFT")
+        self.p.arm_goal("left", self.p.park_side("left"), seconds=1.5)
+        self.assert_allowed("after parking the left arm")
+        replay = self.assert_lift_still(time.monotonic(), "after re-activation (no replay)", seconds=3.0)
+        self.case(name, replay_moved_m=replay)
+        self.passed(name)
 
-    def test_l02_4_activating_the_controller_from_outside_while_blocked_is_undone(self):
-        self.case("4_external_activation", allowed_before=self.precondition_allowed())
-        self.p.arm_goal("left", self.out, seconds=2.0)
-        blocked = self.p.wait_blocked("ARM_NOT_STOWED_LEFT")
+    # ---- 09 outside activation --------------------------------------------------------------------------------------------------------
+    def test_l02_09_an_outside_activation_while_blocked_is_undone(self):
+        name = "09_outside_activation"
+        self.start(name)
+        self.p.arm_goal("left", self.far_out("left"), seconds=1.5)
+        blocked = self.p.wait_blocked("ARM_NOT_STOWED_LEFT", timeout=self.b.pose_reaction)
+        t0 = time.monotonic()
         switched = self.p.switch(activate=[LIFT_CONTROLLER])
-        undone = self.p.wait_for(lambda: self.p.lift_controller_state() != "active", BLOCK_WITHIN_S)
-        self.case("4_external_activation", blocked_before_switch=blocked is not None, switch_ok=switched, undone_after_s=undone)
-        self.p.arm_goal("left", self.park["left"], seconds=2.0)
-        self.assertIsNotNone(undone, f"{LIFT_CONTROLLER} stayed active for {BLOCK_WITHIN_S:.1f} s after an outside activation with the left "
-                                     "arm out of park")
+        self.p.lift_topic_command(self.p.lift() + 0.05, 2.0)         # the worst case: a command arrives in the window
+        undone = self.p.wait_for(lambda: self.p.lift_controller_state() != "active", self.b.pose_reaction + 1.0)
+        time.sleep(1.0)
+        travel = self.p.lift_motion_since(t0)
+        self.case(name, blocked_before=blocked is not None, switch_ok=switched, undone_after_s=undone, travel_m=round(travel, 5),
+                  travel_budget_m=round(self.b.travel_after_violation, 4))
+        self.p.arm_goal("left", self.p.park_side("left"), seconds=1.5)
+        self.assertIsNotNone(undone, f"{LIFT_CONTROLLER} stayed active after an outside activation with the left arm out")
+        self.assertLessEqual(travel, self.b.travel_after_violation, f"the lift travelled {travel:.4f} m in the window")
         self.assertIsNotNone(blocked, "the guard was not blocking before the outside activation")
-        self.assert_allowed("after parking the left arm again")
-        self.passed("4_external_activation")
+        self.passed(name)
 
-    def test_l02_5_an_arm_trajectory_still_running_blocks_even_inside_the_pose_tolerance(self):
-        self.case("5_arm_trajectory_active", allowed_before=self.precondition_allowed())
-        # 0.008 rad on joint1 over 4 s: the pose stays inside stowed_tolerance (0.01) the whole time, but the reference moves at 0.002 rad/s,
-        # above reference_velocity_max (0.001). Only the trajectory condition can see this.
-        nudged = list(self.park["left"])
-        nudged[0] += 0.008
-        n0 = len(self.p.status_log)
-        accepted, handle = self.p.arm_goal("left", nudged, seconds=4.0, wait=False)
-        self.assertTrue(accepted, "left_arm_controller rejected the nudge")
-        self.p.result(handle, 20.0)
-        codes = {c for _, s in self.p.status_log[n0:] for c in s["blocking"]}
-        self.case("5_arm_trajectory_active", codes_seen=sorted(codes))
-        self.p.arm_goal("left", self.park["left"], seconds=4.0)
-        self.assertIn("ARM_TRAJECTORY_ACTIVE_LEFT", codes, "a running left-arm trajectory inside the pose tolerance never blocked the lift")
-        self.assert_allowed("after the nudge back to park")
-        self.passed("5_arm_trajectory_active")
+    # ---- 10 mid-motion ----------------------------------------------------------------------------------------------------------------
+    def test_l02_10_an_arm_leaving_park_mid_move_stops_the_lift_up_and_down(self):
+        name = "10_mid_motion"
+        rows = {}
+        for side, delta in (("left", 0.06), ("right", -0.06)):
+            self.start(f"{name}_{side}")
+            l0 = self.p.lift()
+            accepted, handle, seconds = self.p.lift_goal(l0 + delta)
+            time.sleep(1.0)
+            t_cmd = time.monotonic()
+            self.p.arm_goal(side, self.far_out(side), seconds=0.5, wait=False)
+            blocked = self.p.wait_blocked(f"ARM_NOT_STOWED_{side.upper()}", timeout=self.b.pose_reaction + 1.0)
+            status = self.p.result(handle, seconds + 10.0)[0] if accepted else None
+            time.sleep(self.b.settle + 0.5)
+            stopped = self.p.lift()
+            tl = self.p.timeline()
+            t_cross = first_crossing(tl.arms, lambda e: e[1][side] > self.tol, after=t_cmd)
+            at_cross = next((p for t, p in reversed(tl.lift) if t <= (t_cross or 0)), None)
+            travel = abs(stopped - at_cross) if at_cross is not None else None
+            t_hold = time.monotonic()
+            time.sleep(2.0)
+            hold = self.p.lift_motion_since(t_hold)
+            rows[side] = {"direction": "up" if delta > 0 else "down", "accepted": accepted, "goal_status": status,
+                          "blocked": blocked is not None, "travel_after_crossing_m": None if travel is None else round(travel, 5),
+                          "stopped_at": stopped, "target": l0 + delta, "hold_m": round(hold, 5)}
+            self.p.arm_goal(side, self.p.park_side(side), seconds=1.5)
+            self.p.wait_allowed(self.b.allow_within)
+            rows[side]["resume_m"] = round(self.assert_lift_still(time.monotonic(), f"{side}: after re-parking (no resume)", seconds=3.0), 5)
+        self.case(name, rows=rows, travel_budget_m=round(self.b.travel_after_violation, 4))
+        for side, r in rows.items():
+            self.assertTrue(r["accepted"], f"{side}: the lift goal was rejected before the arm moved (precondition)")
+            self.assertGreater(abs(r["target"] - r["stopped_at"]), 0.005, f"{side}: the lift reached its target although the arm left park")
+            self.assertIsNotNone(r["travel_after_crossing_m"], f"{side}: the arm never crossed the tolerance in the recording")
+            self.assertLessEqual(r["travel_after_crossing_m"], self.b.travel_after_violation,
+                                 f"{side}: the lift travelled {r['travel_after_crossing_m']:.4f} m after the arm left the tolerance")
+            self.assertLessEqual(r["hold_m"], lift_still_m(PROFILE), f"{side}: no hold after the stop")
+            self.assertTrue(r["blocked"], f"{side}: not blocked with ARM_NOT_STOWED_{side.upper()}")
+        self.passed(name)
 
-    def test_l02_6_arm_leaves_park_mid_motion_the_lift_stops_holds_and_does_not_resume(self):
-        self.case("6_mid_motion", allowed_before=self.precondition_allowed())
-        l0 = self.p.lift()
-        target = l0 + 0.06
-        accepted, handle, seconds = self.p.lift_goal(target)
-        self.assertTrue(accepted, "the lift goal was rejected before the arm moved (case precondition)")
-        time.sleep(1.0)
-        t_out = time.monotonic()
-        self.p.arm_goal("left", self.out, seconds=1.0, wait=False)
-        blocked = self.p.wait_blocked("ARM_NOT_STOWED_LEFT")
-        blocked_after = None if blocked is None else round(time.monotonic() - t_out, 2)
-        status, _ = self.p.result(handle, seconds + 10.0)
-        time.sleep(1.0)
-        stopped_at = self.p.lift()
-        hold = max_excursion(self.p.sample_lift(3.0), stopped_at)
-        self.case("6_mid_motion", goal_status=status, blocked_after_s=blocked_after, target=target, stopped_at=stopped_at,
-                  hold_worst_m=round(hold, 4))
-        self.assertLess(stopped_at, target - 0.005, f"the lift reached {stopped_at:.4f} m (target {target:.4f}) although the left arm left park")
-        self.assertLessEqual(hold, lift_still_m(PROFILE), f"the lift did not hold after the stop: moved {hold:.4f} m")
-        self.assertIsNotNone(blocked, "not blocked with ARM_NOT_STOWED_LEFT after the arm left park")
-        self.p.arm_goal("left", self.park["left"], seconds=2.0)
-        self.assert_allowed("after parking the left arm again")
-        self.assert_lift_still(stopped_at, 4.0, "after re-activation (no resume of the old goal)")
-        accepted, handle, seconds = self.p.lift_goal(l0)
-        if accepted:
-            self.p.result(handle, seconds + 15.0)
-        self.passed("6_mid_motion")
-
-    def test_l02_7_arm_joint_state_stopping_blocks(self):
-        self.case("7_arm_state_stale", allowed_before=self.precondition_allowed())
-        l0 = self.p.lift()
+    # ---- 11 arm state stops -----------------------------------------------------------------------------------------------------------
+    def test_l02_11_arm_joint_state_stopping_blocks(self):
+        name = "11_arm_state_stops"
+        self.start(name)
         self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
         try:
-            took = self.p.wait_for(lambda: self.p.blocked()
-                                   and bool({"ARM_STATE_STALE", "ARM_STATE_MISSING"} & set(self.p.current_status()["blocking"]))
-                                   and self.p.lift_controller_state() != "active", BLOCK_WITHIN_S)
-            accepted, handle, seconds = self.p.lift_goal(l0 + 0.03)
-            if accepted:
-                self.p.result(handle, seconds + 10.0)
-            self.p.lift_topic_command(l0 + 0.06, 2.0)
-            time.sleep(3.0)
+            took = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"), timeout=self.b.stale_reaction)
+            accepted, _, _ = self.p.lift_goal(START_HEIGHT + 0.03)
         finally:
             self.p.switch(activate=["joint_state_broadcaster"])
-        # lift_joint is read from /joint_states, which the broadcaster feeds: read it once the broadcaster is back
         time.sleep(1.0)
-        moved = abs(self.p.lift() - l0)
-        self.case("7_arm_state_stale", blocked_after_s=took, action_accepted=accepted, moved_m=round(moved, 4))
+        moved = abs(self.p.lift() - START_HEIGHT)
+        self.case(name, blocked_after_s=took, action_accepted=accepted, moved_m=round(moved, 5))
         self.assertLessEqual(moved, lift_still_m(PROFILE), f"the lift moved {moved:.4f} m while there was no arm state")
         self.assertFalse(accepted, "lift_controller accepted a goal with no arm state")
-        self.assertIsNotNone(took, f"no ARM_STATE_STALE/MISSING block within {BLOCK_WITHIN_S:.1f} s of the arm state stopping")
-        self.assert_allowed("after the arm state came back")
-        self.passed("7_arm_state_stale")
+        self.assertIsNotNone(took, f"no ARM_STATE_STALE/MISSING within {self.b.stale_reaction:.2f} s of the arm state stopping")
+        self.passed(name)
 
-    def test_l02_8_odom_reporting_base_motion_blocks(self):
-        self.case("8_base_moving", allowed_before=self.precondition_allowed())
-        l0 = self.p.lift()
-        # The mock zero-odom stub keeps publishing and these messages interleave with it. "Base stopped" must hold CONTINUOUSLY for
-        # base_stopped_hold_s, so one moving sample is enough to block.
-        moving = Odometry()
-        moving.header.frame_id, moving.child_frame_id = "odom", "base_footprint"
-        moving.twist.twist.linear.x = 0.2
-        stop = threading.Event()
-
-        def publish():
-            while not stop.is_set():
-                moving.header.stamp = self.p.node.get_clock().now().to_msg()
-                self.p.odom.publish(moving)
-                time.sleep(0.02)
-        publisher = threading.Thread(target=publish, daemon=True)
-        publisher.start()
+    # ---- 12 injected arm state --------------------------------------------------------------------------------------------------------
+    def test_l02_12_injected_arm_state_per_joint_freshness_and_nan(self):
+        name = "12_injected_arm_state"
+        self.start(name)
+        parked = {j: self.park[j] for j in ALL_ARM_JOINTS}
+        current = {"pos": dict(parked)}
+        rows = {}
+        self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
         try:
-            took = self.p.wait_for(lambda: self.p.blocked() and "BASE_MOVING" in self.p.current_status()["blocking"]
-                                   and self.p.lift_controller_state() != "active", BLOCK_WITHIN_S)
-            time.sleep(max(0.0, 1.5 - (took or 0.0)))
-            accepted, handle, seconds = self.p.lift_goal(l0 + 0.03)
-            if accepted:
-                self.p.result(handle, seconds + 10.0)
-            worst = max_excursion(self.p.sample_lift(1.0), l0)
+            with self.p.inject_arm_states(lambda: current["pos"]):
+                rows["fresh_parked_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within + self.b.stale_reaction)
+                current["pos"] = {j: v for j, v in parked.items() if j != "openarm_right_joint7"}
+                rows["one_joint_absent_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"),
+                                                                               timeout=self.b.stale_reaction)
+                current["pos"] = dict(parked)
+                rows["restored_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within)
+                current["pos"] = {**parked, "openarm_left_joint3": math.nan}
+                rows["nan_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_NOT_STOWED_LEFT", "ARM_STATE_STALE", "ARM_STATE_MISSING"),
+                                                                  timeout=self.b.pose_reaction)
+                current["pos"] = dict(parked)
         finally:
-            stop.set()
-            publisher.join(2.0)
-        self.case("8_base_moving", blocked_after_s=took, action_accepted=accepted, worst_m=round(worst, 4))
-        self.assertLessEqual(worst, lift_still_m(PROFILE), f"the lift moved {worst:.4f} m while /odom reported the base moving")
-        self.assertFalse(accepted, "lift_controller accepted a goal while /odom reported the base moving")
-        self.assertIsNotNone(took, f"/odom at 0.2 m/s never blocked the lift with BASE_MOVING within {BLOCK_WITHIN_S:.1f} s")
-        self.assert_allowed("after /odom went back to the stub's zero")
-        self.passed("8_base_moving")
+            self.p.switch(activate=["joint_state_broadcaster"])
+        self.case(name, **rows)
+        self.assertIsNotNone(rows["fresh_parked_allowed_after_s"], "fresh, parked injected arm state was never allowed (does the guard read "
+                             f"{'/joint_states'}?)")
+        self.assertIsNotNone(rows["one_joint_absent_blocked_after_s"], "openarm_right_joint7 absent from every message did not block: "
+                             "freshness must be per joint (#44 design)")
+        self.assertIsNotNone(rows["nan_blocked_after_s"], "a NaN position for openarm_left_joint3 did not block: NaN must never read as stowed")
+        self.passed(name)
 
-    @unittest.skip("waiting on #44: the mock zero-odom stub has no way to be stopped from a test yet")
-    def test_l02_9_odom_stopping_blocks(self):
-        pass
+    # ---- 13 MoveIt --------------------------------------------------------------------------------------------------------------------
+    def test_l02_13_a_moveit_lift_request_with_an_arm_out_does_not_move_the_lift(self):
+        name = "13_moveit"
+        self.start(name)
+        from openamrobot_upperbody_moveit.move_group_client import MoveGroupClient
+        node = rclpy.create_node("l02_moveit_client")
+        try:
+            client = MoveGroupClient(node)
+            self.assertTrue(client.wait_for_server(60.0), "move_group's /move_action did not appear")
+            self.p.arm_goal("left", self.far_out("left"), seconds=1.5)
+            self.p.wait_blocked("ARM_NOT_STOWED_LEFT", timeout=self.b.pose_reaction)
+            t0 = time.monotonic()
+            outcome = client.move("lift", {LIFT: START_HEIGHT + 0.03}, result_timeout=30.0)
+            moved = self.p.lift_motion_since(t0)
+        finally:
+            node.destroy_node()
+        self.case(name, moveit_outcome=outcome.as_dict(), moved_m=round(moved, 5))
+        self.p.arm_goal("left", self.p.park_side("left"), seconds=1.5)
+        self.assertLessEqual(moved, lift_still_m(PROFILE), f"MoveIt moved the lift {moved:.4f} m with the left arm out")
+        succeeded = outcome.success() if callable(outcome.success) else outcome.success
+        self.assertFalse(succeeded, f"MoveIt reported success for a lift move with the left arm out: {outcome.as_dict()}")
+        self.passed(name)
+
+    # ---- 14 two reasons ---------------------------------------------------------------------------------------------------------------
+    def test_l02_14_two_reasons_at_once_are_both_reported_and_cleared_separately(self):
+        name = "14_two_reasons"
+        self.start(name)
+        self.p.arm_goal("left", self.far_out("left"), seconds=1.5)
+        self.p.arm_goal("right", self.far_out("right"), seconds=1.5)
+        both = self.p.wait_for(lambda: self.p.blocked("ARM_NOT_STOWED_LEFT") and self.p.blocked("ARM_NOT_STOWED_RIGHT"), self.b.pose_reaction)
+        self.p.arm_goal("left", self.p.park_side("left"), seconds=1.5)
+        only_right = self.p.wait_for(lambda: self.p.blocked("ARM_NOT_STOWED_RIGHT") and not self.p.blocked("ARM_NOT_STOWED_LEFT"),
+                                     self.b.pose_reaction)
+        still_blocked = self.p.lift_controller_state() != "active"
+        self.p.arm_goal("right", self.p.park_side("right"), seconds=1.5)
+        allowed = self.p.wait_allowed(self.b.allow_within)
+        self.case(name, both_codes_after_s=both, only_right_after_s=only_right, still_blocked=still_blocked, allowed_after_s=allowed)
+        self.assertIsNotNone(both, "both arms out did not report both ARM_NOT_STOWED codes")
+        self.assertIsNotNone(only_right, "after parking the left arm the status did not keep ARM_NOT_STOWED_RIGHT alone")
+        self.assertTrue(still_blocked, f"{LIFT_CONTROLLER} was active with the right arm still out")
+        self.assertIsNotNone(allowed, "not allowed after both arms were parked")
+        self.passed(name)
+
+    # ---- zz run-wide --------------------------------------------------------------------------------------------------------------------
+    def test_l02_zz_safety_properties_held_throughout_the_run(self):
+        self.check_properties()
 
 
 class TestProcessesAlive(unittest.TestCase):
@@ -309,4 +443,4 @@ class TestProcessesAlive(unittest.TestCase):
 @unittest.skipUnless(A7_ENABLED, SKIP_REASON)
 class TestShutdown(unittest.TestCase):
     def test_l02_processes_started_and_exited_cleanly(self, proc_info):
-        stack_healthy(proc_info, expected=EXPECTED_PROCESSES, sidecar=("L02", "lift_guard_mock"))
+        stack_healthy(proc_info, expected=EXPECTED_PROCESSES, sidecar=("L02", "lift_guard_arms_mock"))

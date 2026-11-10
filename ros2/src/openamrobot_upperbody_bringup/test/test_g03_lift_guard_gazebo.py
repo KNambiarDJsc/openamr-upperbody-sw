@@ -3,21 +3,25 @@
 
 1. /joint_states is joint_state_publisher's merge of /arm/joint_states and /base/joint_states (sim.launch.py). When the arm source stops, the
    merge keeps publishing the arm joints with frozen positions and fresh stamps (#44 baseline, row D). The guard must read /arm/joint_states.
-2. The base is simulated (DiffDrive), so "base moving" comes from a real /odom. After #49, odometry alone is not evidence of motion: the
-   base's true displacement is read from the simulator and recorded next to what /odom said.
+2. The base is simulated (DiffDrive), so "base moving" comes from a real /odom. After #49 odometry alone is not evidence of motion: the base's
+   true displacement is read from the simulator and recorded next to what /odom said.
 
 Lift motion is asserted from lift_joint on /arm/joint_states AND from the simulator's own pose of lift_carriage_link (#44 acceptance 4). An
-action result is never evidence of motion: in DART a goal reported success while the lift stayed at 0 (#49).
+action result is never evidence of motion: in DART a goal reported success while the lift stayed at 0 (#49). In dynamic_pose/info the model's
+entry ("openamrobot") is its WORLD pose; link entries are relative to the model, which is what the carriage height needs.
 
-Engine: bullet-featherstone, passed explicitly, as M02 does. Until #49's root cause is fixed DART does not move the lift, and a
-"did not move" check would pass for the wrong reason; the positive control (case 1) would catch it, but there is no point running it.
+Engine: bullet-featherstone, passed explicitly, as M02 does. Until #49's root cause is fixed DART does not move the lift, and a "did not move"
+check would pass for the wrong reason; the positive control (case 01) is there to catch exactly that.
 
-Cases (each leaves both arms in park and the guard allowing):
-  1  allowed: a lift goal moves lift_joint and the carriage in the simulator (positive control)
-  2  left arm out: blocked with ARM_NOT_STOWED_LEFT; neither the action nor the topic moves the lift
-  3  arm source stopped (joint_state_broadcaster deactivated) while the merge still publishes the arm joints: blocked with ARM_STATE_STALE
-     or ARM_STATE_MISSING, and the lift does not move
-  4  base driven at 0.2 m/s through /cmd_vel: blocked with BASE_MOVING; the base's true displacement is recorded
+Budgets are twice mock's: the simulator runs below real time on a CI runner, and the guard's clock is sim time.
+
+Cases (each from: both arms parked, lift at 0.10 m)
+  01 allowed: a lift goal moves lift_joint and the carriage in the simulator (positive control)
+  02 left arm out: blocked with ARM_NOT_STOWED_LEFT; neither the action nor the topic moves the carriage
+  03 arm source stopped while the merge still publishes the arm joints: blocked with ARM_STATE_*, and the carriage does not move
+  04 injected /arm/joint_states with one joint absent: blocked (per-joint freshness, on the topic the merge would hide)
+  05 base driven at 0.2 m/s through /cmd_vel: blocked with BASE_MOVING; true travel and odometry travel are both recorded
+  zz the safety properties P1-P6 over the whole run
 
 Simulation only; nothing here is evidence about the firmware interlock (CTL-017).
 """
@@ -36,26 +40,20 @@ import launch  # noqa: E402
 import launch_testing  # noqa: E402
 import launch_testing.actions  # noqa: E402
 import pytest  # noqa: E402
-import rclpy  # noqa: E402
-from ament_index_python.packages import get_package_share_directory  # noqa: E402
 from geometry_msgs.msg import Twist  # noqa: E402
 from nav_msgs.msg import Odometry  # noqa: E402
-from launch.launch_description_sources import PythonLaunchDescriptionSource  # noqa: E402
 from sensor_msgs.msg import JointState  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "openamrobot_upperbody_gazebo", "test"))
-from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy, write_run_sidecar  # noqa: E402
-from lift_guard_support import (ALLOW_WITHIN_S, ARM_JOINTS, BLOCK_WITHIN_S, INTERFACE, PROVISIONAL, GuardProbe, lift_still_m,  # noqa: E402
-                                max_excursion, park_of, srdf_states)
+from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # noqa: E402
+from lift_guard_support import ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, GuardCase, lift_still_m, stack_under_test  # noqa: E402
 from sim_test_support import gz_link_poses  # noqa: E402
 
 PROFILE = "gazebo"
 ENGINE = "gz-physics-bullet-featherstone-plugin"
-STARTUP_WITHIN_S = 240.0
-CARRIAGE = "lift_carriage_link"
-MODEL = "openamrobot"     # the robot model's entry in dynamic_pose/info is its WORLD pose; link entries are relative to it
+CARRIAGE, MODEL = "lift_carriage_link", "openamrobot"
 EXPECTED_PROCESSES = ["robot_state_publisher", "spawner", "move_group", INTERFACE["process_pattern"]]
 
 
@@ -63,49 +61,43 @@ EXPECTED_PROCESSES = ["robot_state_publisher", "spawner", "move_group", INTERFAC
 def generate_test_description():
     if not A7_ENABLED:
         return launch.LaunchDescription([launch.actions.ExecuteProcess(cmd=["sleep", "30"]), launch_testing.actions.ReadyToTest()]), {}
-    moveit = os.path.join(get_package_share_directory("openamrobot_upperbody_bringup"), "launch", "moveit.launch.py")
-    return launch.LaunchDescription([
-        launch.actions.IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(moveit),
-            launch_arguments={"sim": PROFILE, "rviz": "false", "headless": "true", "physics_engine": ENGINE}.items()),
-        launch_testing.actions.ReadyToTest(),
-    ]), {}
+    stack, _ = stack_under_test(PROFILE, headless="true", physics_engine=ENGINE)
+    return launch.LaunchDescription([stack, launch_testing.actions.ReadyToTest()]), {}
 
 
-def true_z(name=CARRIAGE):
-    """z of a link as the simulator has it (gz transport), or None if the pose message does not carry it."""
+def gz_position(name):
     try:
         pose = gz_link_poses().get(name)
     except Exception:
         return None
-    return None if pose is None else pose["position"].get("z", 0.0)
-
-
-def true_xy(name):
-    try:
-        pose = gz_link_poses().get(name)
-    except Exception:
+    if pose is None:
         return None
-    return None if pose is None else (pose["position"].get("x", 0.0), pose["position"].get("y", 0.0))
+    pos = pose.get("position", {})
+    return (pos.get("x", 0.0), pos.get("y", 0.0), pos.get("z", 0.0))
+
+
+def carriage_z():
+    p = gz_position(CARRIAGE)
+    return None if p is None else p[2]
 
 
 @unittest.skipUnless(A7_ENABLED, SKIP_REASON)
-class TestLiftGuardGazebo(unittest.TestCase):
-    record = {"profile": PROFILE, "physics_engine": ENGINE, "interface": INTERFACE, "provisional": PROVISIONAL, "cases": {}}
+class TestLiftGuardGazebo(GuardCase, unittest.TestCase):
+    PROFILE = PROFILE
+    NODE = "g03_lift_guard"
+    CHECK_ID, SLUG, NAME = "G03", "lift_guard_gazebo", "#44 lift guard in Gazebo"
 
     @classmethod
     def setUpClass(cls):
-        rclpy.init()
-        cls.p = GuardProbe(PROFILE, "g03_lift_guard")
-        cls.merged_t = {}
+        super().setUpClass()
+        for k in ("pose_reaction", "base_reaction", "stale_reaction", "allow_within", "status_lag"):
+            setattr(cls.b, k, getattr(cls.b, k) * 2.0)
+        cls.b.travel_after_violation = 0.015 * cls.b.pose_reaction + lift_still_m(PROFILE)
+        cls.record["budgets_s"] = cls.b.as_dict()
+        cls.merged_t, cls.odom_xy = {}, None
         cls.p.node.create_subscription(JointState, "/joint_states", cls._on_merged, 50)
-        cls.cmd_vel = cls.p.node.create_publisher(Twist, "/cmd_vel", 10)
-        cls.odom_xy = None
         cls.p.node.create_subscription(Odometry, "/odom", cls._on_odom, 10)
-        states = srdf_states()
-        cls.park = {s: park_of(states, s) for s in ARM_JOINTS}
-        cls.out = list(cls.park["left"])
-        cls.out[3] = 1.5
+        cls.cmd_vel = cls.p.node.create_publisher(Twist, "/cmd_vel", 10)
 
     @classmethod
     def _on_merged(cls, msg):
@@ -117,102 +109,103 @@ class TestLiftGuardGazebo(unittest.TestCase):
     def _on_odom(cls, msg):
         cls.odom_xy = (msg.pose.pose.position.x, msg.pose.pose.position.y)
 
-    @classmethod
-    def tearDownClass(cls):
-        cases = cls.record["cases"]
-        ok = bool(cases) and all(c.get("ok") for c in cases.values())
-        write_run_sidecar("G03", "lift_guard_gazebo", "#44 lift guard acceptance in Gazebo", "PASS" if ok else "FAIL", cls.record)
-        cls.p.close()
-        rclpy.shutdown()
+    def far_out(self, side):
+        pose = self.p.park_side(side)
+        pose[3] = 1.5
+        return pose
 
-    def case(self, name, **fields):
-        self.record["cases"].setdefault(name, {"ok": False}).update(fields)
+    def assert_carriage_still(self, z0, what):
+        z1 = carriage_z()
+        dz = None if None in (z0, z1) else z1 - z0
+        self.assertIsNotNone(dz, f"{what}: no ground truth for {CARRIAGE}")
+        self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"{what}: the carriage moved {dz:.4f} m in the simulator")
+        return round(dz, 5)
 
-    def passed(self, name):
-        self.record["cases"][name]["ok"] = True
-
-    def precondition_allowed(self):
-        return self.p.wait_allowed() is not None
-
-    def assert_allowed(self, what):
-        self.assertIsNotNone(self.p.wait_allowed(), f"{what}: the guard did not allow the lift within {ALLOW_WITHIN_S:.1f} s "
-                                                    f"(status {self.p.current_status()})")
-
-    def test_g03_1_allowed_a_lift_goal_moves_the_lift_in_the_simulator(self):
-        self.assertTrue(self.p.wait_for_joints(STARTUP_WITHIN_S), "/arm/joint_states never listed lift_joint and all 14 arm joints")
-        self.case("1_positive_control", allowed_before=self.p.wait_allowed(STARTUP_WITHIN_S) is not None)
+    def test_g03_01_allowed_a_lift_goal_moves_the_carriage_in_the_simulator(self):
+        name = "01_positive_control"
+        self.start(name)
         try:
-            poses = gz_link_poses()
-            self.record["gz_pose_entries"] = {n: p.get("position") for n, p in poses.items()
-                                              if n in (CARRIAGE, "base_footprint", "base_link") or "lift" in n or "openamrobot" in n}
-        except Exception as e:  # recorded: the ground-truth cases below say what is missing
+            self.record["gz_pose_entries"] = {n: p.get("position") for n, p in gz_link_poses().items() if n in (CARRIAGE, MODEL)}
+        except Exception as e:
             self.record["gz_pose_entries"] = repr(e)
-        l0, z0 = self.p.lift(), true_z()
-        accepted, handle, seconds = self.p.lift_goal(l0 + 0.03)
-        self.assertTrue(accepted, "the lift goal was rejected while the guard reported OK")
-        self.p.result(handle, seconds + 20.0)
+        l0, z0 = self.p.lift(), carriage_z()
+        accepted, _ = self.p.lift_goal_and_wait(l0 + 0.03)
         time.sleep(1.0)
-        moved, z1 = self.p.lift() - l0, true_z()
-        self.case("1_positive_control", joint_moved_m=round(moved, 4), carriage_z_before=z0, carriage_z_after=z1)
+        moved, z1 = self.p.lift() - l0, carriage_z()
+        self.case(name, accepted=accepted, joint_moved_m=round(moved, 4), carriage_moved_m=None if None in (z0, z1) else round(z1 - z0, 4))
+        self.assertTrue(accepted, "the lift goal was rejected while the guard allowed the lift")
         self.assertGreater(moved, 0.025, f"lift_joint moved {moved:.4f} m of 0.03")
         self.assertIsNotNone(z0, f"the simulator's pose message has no {CARRIAGE}: no ground truth")
         self.assertGreater(z1 - z0, 0.025, f"the simulator moved {CARRIAGE} {z1 - z0:.4f} m of 0.03 (lift_joint said {moved:.4f})")
-        accepted, handle, seconds = self.p.lift_goal(l0)
-        self.p.result(handle, seconds + 20.0)
-        self.passed("1_positive_control")
+        self.passed(name)
 
-    def test_g03_2_arm_out_blocks_both_command_paths(self):
-        self.case("2_arm_out", allowed_before=self.precondition_allowed())
-        self.p.arm_goal("left", self.out, seconds=2.0)
-        took = self.p.wait_blocked("ARM_NOT_STOWED_LEFT")
-        l0, z0 = self.p.lift(), true_z()
-        accepted, handle, seconds = self.p.lift_goal(l0 + 0.03)
-        if accepted:
-            self.p.result(handle, seconds + 20.0)
-        self.p.lift_topic_command(self.p.lift() + 0.03, 2.0)
-        worst = max_excursion(self.p.sample_lift(4.0), l0)
-        z1 = true_z()
-        dz = None if None in (z0, z1) else z1 - z0
-        self.case("2_arm_out", blocked_after_s=took, action_accepted=accepted, joint_worst_m=round(worst, 4), carriage_dz_m=dz)
-        self.p.arm_goal("left", self.park["left"], seconds=2.0)
-        self.assertLessEqual(worst, lift_still_m(PROFILE), f"lift_joint moved {worst:.4f} m with the left arm out of park")
-        if dz is not None:
-            self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"the carriage moved {dz:.4f} m in the simulator with the left arm out")
+    def test_g03_02_arm_out_blocks_both_command_paths(self):
+        name = "02_arm_out"
+        self.start(name)
+        self.p.arm_goal("left", self.far_out("left"), seconds=2.0)
+        took = self.p.wait_blocked("ARM_NOT_STOWED_LEFT", timeout=self.b.pose_reaction + 1.0)
+        z0 = carriage_z()
+        accepted, t0 = self.try_lift_both_paths(0.03)
+        time.sleep(1.0)
+        joint_moved = self.p.lift_motion_since(t0)
+        dz = carriage_z()
+        dz = None if None in (z0, dz) else dz - z0
+        self.case(name, blocked_after_s=took, action_accepted=accepted, joint_moved_m=round(joint_moved, 5), carriage_dz_m=dz)
+        self.p.arm_goal("left", self.p.park_side("left"), seconds=2.0)
+        self.assertLessEqual(joint_moved, lift_still_m(PROFILE), f"lift_joint moved {joint_moved:.4f} m with the left arm out")
+        self.assertIsNotNone(dz, f"no ground truth for {CARRIAGE}")
+        self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"the carriage moved {dz:.4f} m in the simulator with the left arm out")
         self.assertFalse(accepted, "lift_controller accepted a goal with the left arm out of park")
-        self.assertIsNotNone(took, f"not blocked with ARM_NOT_STOWED_LEFT within {BLOCK_WITHIN_S:.1f} s: {self.p.current_status()}")
-        self.assert_allowed("after parking the left arm again")
-        self.passed("2_arm_out")
+        self.assertIsNotNone(took, "not blocked with ARM_NOT_STOWED_LEFT")
+        self.passed(name)
 
-    def test_g03_3_arm_source_stopped_blocks_although_the_merge_looks_fresh(self):
-        self.case("3_arm_state_stale", allowed_before=self.precondition_allowed())
-        z0 = true_z()
+    def test_g03_03_arm_source_stopped_blocks_although_the_merge_looks_fresh(self):
+        name = "03_arm_source_stopped"
+        self.start(name)
+        z0 = carriage_z()
         self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
         try:
-            took = self.p.wait_for(lambda: self.p.blocked()
-                                   and bool({"ARM_STATE_STALE", "ARM_STATE_MISSING"} & set(self.p.current_status()["blocking"]))
-                                   and self.p.lift_controller_state() != "active", BLOCK_WITHIN_S)
+            took = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"), timeout=self.b.stale_reaction)
             time.sleep(1.0)
             now = time.monotonic()
             merged_fresh = all(now - self.merged_t.get(j, 0.0) < 0.5 for j in ARM_JOINTS["left"])
-            accepted, handle, seconds = self.p.lift_goal((self.p.lift() or 0.0) + 0.03)
-            if accepted:
-                self.p.result(handle, seconds + 20.0)
-            time.sleep(2.0)
-            z1 = true_z()
+            accepted, _ = self.try_lift_both_paths(0.03)
+            time.sleep(1.0)
+            dz = self.assert_carriage_still(z0, "arm source stopped")
         finally:
             self.p.switch(activate=["joint_state_broadcaster"])
-        dz = None if None in (z0, z1) else z1 - z0
-        self.case("3_arm_state_stale", blocked_after_s=took, merged_still_fresh=merged_fresh, action_accepted=accepted, carriage_dz_m=dz)
-        self.assertIsNotNone(dz, f"no ground truth for {CARRIAGE}: with the broadcaster off it is the only reading of the lift")
-        self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"the carriage moved {dz:.4f} m in the simulator with no arm state")
+        self.case(name, blocked_after_s=took, merged_still_fresh=merged_fresh, action_accepted=accepted, carriage_dz_m=dz)
         self.assertFalse(accepted, "lift_controller accepted a goal with the arm source stopped")
-        self.assertIsNotNone(took, f"no ARM_STATE_STALE/MISSING block within {BLOCK_WITHIN_S:.1f} s of the arm source stopping")
-        self.assert_allowed("after the arm source came back")
-        self.passed("3_arm_state_stale")
+        self.assertIsNotNone(took, f"no ARM_STATE_STALE/MISSING within {self.b.stale_reaction:.2f} s although /arm/joint_states stopped "
+                                   f"(the merged /joint_states still fresh: {merged_fresh})")
+        self.passed(name)
 
-    def test_g03_4_base_driving_blocks_and_the_true_displacement_is_recorded(self):
-        self.case("4_base_moving", allowed_before=self.precondition_allowed())
-        base0, z0, odom0 = true_xy(MODEL), true_z(), self.odom_xy
+    def test_g03_04_one_joint_absent_from_the_raw_arm_state_blocks(self):
+        name = "04_one_joint_absent"
+        self.start(name)
+        parked = {j: self.park[j] for j in ALL_ARM_JOINTS}
+        current = {"pos": dict(parked)}
+        rows = {}
+        self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
+        try:
+            with self.p.inject_arm_states(lambda: current["pos"]):
+                rows["fresh_parked_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within + self.b.stale_reaction)
+                current["pos"] = {j: v for j, v in parked.items() if j != "openarm_left_joint7"}
+                rows["one_joint_absent_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"),
+                                                                               timeout=self.b.stale_reaction)
+                current["pos"] = dict(parked)
+        finally:
+            self.p.switch(activate=["joint_state_broadcaster"])
+        self.case(name, **rows)
+        self.assertIsNotNone(rows["fresh_parked_allowed_after_s"], "fresh parked arm state injected on /arm/joint_states was never allowed: "
+                             "does the guard read /arm/joint_states in Gazebo?")
+        self.assertIsNotNone(rows["one_joint_absent_blocked_after_s"], "openarm_left_joint7 absent from every message did not block")
+        self.passed(name)
+
+    def test_g03_05_base_driving_blocks_and_the_true_travel_is_recorded(self):
+        name = "05_base_moving"
+        self.start(name)
+        base0, z0, odom0 = gz_position(MODEL), carriage_z(), self.odom_xy
         stop = threading.Event()
 
         def drive():
@@ -227,27 +220,28 @@ class TestLiftGuardGazebo(unittest.TestCase):
         driver = threading.Thread(target=drive, daemon=True)
         driver.start()
         try:
-            took = self.p.wait_blocked("BASE_MOVING")
-            accepted, handle, seconds = self.p.lift_goal((self.p.lift() or 0.0) + 0.03)
-            if accepted:
-                self.p.result(handle, seconds + 20.0)
+            took = self.p.wait_blocked("BASE_MOVING", timeout=self.b.base_reaction + 2.0)
+            accepted, _ = self.try_lift_both_paths(0.03)
             time.sleep(1.0)
-            z1 = true_z()
+            z1 = carriage_z()
         finally:
             stop.set()
             driver.join(3.0)
-        base1, odom1 = true_xy(MODEL), self.odom_xy
-        travelled = None if None in (base0, base1) else ((base1[0] - base0[0]) ** 2 + (base1[1] - base0[1]) ** 2) ** 0.5
-        dz = None if None in (z0, z1) else z1 - z0
-        odom_travel = None if None in (odom0, odom1) else ((odom1[0] - odom0[0]) ** 2 + (odom1[1] - odom0[1]) ** 2) ** 0.5
-        self.case("4_base_moving", blocked_after_s=took, action_accepted=accepted, carriage_dz_m=dz, base_true_travel_m=travelled,
-                  base_odom_travel_m=odom_travel, note="true travel from the simulator's model pose; odom from /odom (#49: they can disagree)")
-        if dz is not None:
-            self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"the carriage moved {dz:.4f} m while the base was driven")
+        base1, odom1 = gz_position(MODEL), self.odom_xy
+
+        def dist(a, b):
+            return None if None in (a, b) else round(((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5, 4)
+        dz = None if None in (z0, z1) else round(z1 - z0, 5)
+        self.case(name, blocked_after_s=took, action_accepted=accepted, carriage_dz_m=dz, base_true_travel_m=dist(base0, base1),
+                  base_odom_travel_m=dist(odom0, odom1), note="true travel from the simulator's model pose; odom from /odom (#49)")
+        self.assertIsNotNone(dz, f"no ground truth for {CARRIAGE}")
+        self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"the carriage moved {dz:.4f} m while the base was driven")
         self.assertFalse(accepted, "lift_controller accepted a goal while the base was driven")
-        self.assertIsNotNone(took, f"no BASE_MOVING block within {BLOCK_WITHIN_S:.1f} s of driving the base")
-        self.assert_allowed("after the base stopped")
-        self.passed("4_base_moving")
+        self.assertIsNotNone(took, "no BASE_MOVING while the base was driven")
+        self.passed(name)
+
+    def test_g03_zz_safety_properties_held_throughout_the_run(self):
+        self.check_properties()
 
 
 class TestProcessesAlive(unittest.TestCase):
