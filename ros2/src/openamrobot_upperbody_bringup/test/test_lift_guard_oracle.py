@@ -6,7 +6,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lift_guard_oracle import (ERROR, OK, Timeline, arm_deviation, evaluate, no_motion_while_blocked,  # noqa: E402
+from lift_guard_oracle import (ERROR, OK, WARN, Timeline, arm_deviation, evaluate, no_motion_while_blocked,  # noqa: E402
                                no_motion_while_inactive, step_intervals)
 
 CODES = ("ARM_NOT_STOWED_LEFT", "ARM_NOT_STOWED_RIGHT", "ARM_TRAJECTORY_ACTIVE_LEFT", "ARM_TRAJECTORY_ACTIVE_RIGHT",
@@ -95,31 +95,57 @@ def test_p4_status_contract_breaches_are_found():
     assert len(evaluate(tl, **ARGS)["P4_status_contract"]) == 5
 
 
-def test_p6_error_without_a_code_asks_nothing_of_the_controller():
-    """PR #53 run (L03 idle): the spawner activated lift_controller while the guard said 'nothing blocks, not active yet'."""
-    tl = Timeline(end=5.0, status=[(1.0, ERROR, "inactive", ()), (2.0, ERROR, "inactive", ()), (2.1, OK, "active", ())],
+def test_p6_warn_asks_nothing_of_the_controller():
+    """PR #53 run (L03 idle): the spawner activated lift_controller while the guard was still switching on (now WARN, #44 10 Nov)."""
+    tl = Timeline(end=5.0, status=[(1.0, WARN, "activating", ()), (2.0, WARN, "activating", ()), (2.1, OK, "active", ())],
                   controller=[(0.0, "inactive"), (1.5, "active")])
     assert evaluate(tl, **ARGS)["P6_allowed_means_active"] == []
 
 
-def test_p6_error_with_a_code_while_active_beyond_the_lag_is_found():
+def test_p6_error_while_active_beyond_the_lag_is_found():
     tl = Timeline(end=5.0, status=[(1.0, ERROR, "inactive", ("BASE_MOVING",))], controller=[(0.0, "active")])
     assert evaluate(tl, **ARGS)["P6_allowed_means_active"]
 
 
-def test_p1_motion_under_error_without_a_code_is_not_blocked_motion_but_p5_sees_the_misreport():
+def test_p1_motion_under_warn_is_not_blocked_motion_but_p5_sees_the_misreport():
     tl = Timeline(end=5.0, lift=[(t / 10, 0.1 + 0.001 * t) for t in range(0, 40)],
-                  status=[(0.0, ERROR, "inactive", ())], controller=[(0.0, "active")])
+                  status=[(0.0, WARN, "activating", ())], controller=[(0.0, "active")])
     result = evaluate(tl, **ARGS)
     assert result["P1_no_motion_while_blocked"] == []
     assert result["P5_status_matches_controller"]
 
 
-def test_p4_error_without_a_code_while_inactive_is_the_activation_in_progress():
-    """PR #53: nothing blocks, the guard has asked for the switch, lift_controller is not listed active yet."""
-    tl = Timeline(end=1.0, status=[(0.0, ERROR, "inactive", ("BASE_MOVING",)), (0.1, ERROR, "inactive", ()), (0.2, OK, "active", ())],
+def test_p1_motion_under_error_is_found():
+    tl = Timeline(end=5.0, lift=[(t / 10, 0.1 + 0.001 * t) for t in range(0, 40)],
+                  status=[(0.0, ERROR, "inactive", ("BASE_MOVING",))], controller=[(0.0, "inactive")])
+    assert evaluate(tl, **ARGS)["P1_no_motion_while_blocked"]
+
+
+def test_p4_warn_activating_is_the_switching_on_state():
+    """#44, 10 Nov: nothing blocks, the switch is asked for, lift_controller not active yet: WARN, empty blocking, 'activating'."""
+    tl = Timeline(end=1.0, status=[(0.0, ERROR, "inactive", ("BASE_MOVING",)), (0.1, WARN, "activating", ()), (0.2, OK, "active", ())],
                   controller=[(0.0, "inactive"), (0.15, "active")])
     assert evaluate(tl, **ARGS)["P4_status_contract"] == []
+
+
+def test_p4_the_old_switching_on_forms_are_breaches():
+    """#53 at b09a54a sent ERROR with no code while switching on; the first double sent OK while the controller was inactive; WARN must
+    name 'activating' and carry no code."""
+    tl = Timeline(end=1.0, status=[(0.1, ERROR, "inactive", ()), (0.2, OK, "inactive", ()), (0.3, WARN, "inactive", ()),
+                                   (0.4, WARN, "activating", ("BASE_MOVING",)), (0.5, ERROR, "activating", ("BASE_MOVING",))])
+    assert len(evaluate(tl, **ARGS)["P4_status_contract"]) == 5
+
+
+def test_p7_a_long_warn_spell_is_found():
+    tl = Timeline(end=20.0, status=[(1.0, WARN, "activating", ()), (12.5, OK, "active", ())], controller=[(0.0, "inactive")])
+    assert evaluate(tl, **{**ARGS, "warn_max": 3.0})["P7_switching_on_is_brief"]
+
+
+def test_p7_a_short_warn_spell_and_one_before_the_controller_is_loaded_are_fine():
+    tl = Timeline(end=20.0, status=[(0.0, WARN, "activating", ()), (8.0, OK, "active", ()), (10.0, ERROR, "active", ("BASE_MOVING",)),
+                                    (11.0, WARN, "activating", ()), (11.2, OK, "active", ())],
+                  controller=[(7.9, "inactive"), (7.95, "active"), (10.1, "inactive"), (11.15, "active")])
+    assert evaluate(tl, **{**ARGS, "warn_max": 3.0})["P7_switching_on_is_brief"] == []
 
 
 def test_p5_status_disagreeing_with_the_manager_beyond_the_lag_is_found():

@@ -15,16 +15,22 @@ check would pass for the wrong reason; the positive control (case 01) is there t
 
 Budgets are twice mock's: the simulator runs below real time on a CI runner, and the guard's clock is sim time.
 
-Cases (each from: both arms parked, lift at 0.10 m)
+Cases (each from: both arms parked, lift at 0.10 m, except 00)
+  00 start-up (#44, 10 Nov: a start-up trajectory to park on both arm controllers, in Gazebo too): blocked first; lift_controller never
+     active before the first OK; both arms within the tolerance at the first OK; the carriage unmoved in the simulator until then
   01 allowed: a lift goal moves lift_joint and the carriage in the simulator (positive control)
   02 left arm out: blocked with ARM_NOT_STOWED_LEFT; neither the action nor the topic moves the carriage
   03 arm source stopped while the merge still publishes the arm joints: blocked with ARM_STATE_*, and the carriage does not move
   04 injected /arm/joint_states with one joint absent: blocked (per-joint freshness, on the topic the merge would hide)
   05 base driven at 0.2 m/s through /cmd_vel: blocked with BASE_MOVING; true travel and odometry travel are both recorded
-  zz the safety properties P1-P6 over the whole run
+  06 MEASUREMENT for the Gazebo stowed_tolerance (#44, 10 Nov: "set per profile from Karthik's settled-error measurement plus margin"):
+     per-joint |position - park| on /arm/joint_states at rest, during a lift move, while the base drives, and after each arm leaves park
+     and is sent back. Fails only if there is no data, or if the arms at rest in park sit outside the guard's own tolerance
+  zz the safety properties P1-P7 over the whole run
 
 Simulation only; nothing here is evidence about the firmware interlock (CTL-017).
 """
+import math
 import os
 import random
 import sys
@@ -48,7 +54,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "openamrobot_upperbody_gazebo", "test"))
 from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # noqa: E402
-from lift_guard_support import ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, GuardCase, lift_still_m, stack_under_test  # noqa: E402
+from lift_guard_support import (ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, LIFT_CONTROLLER, GuardCase, lift_still_m,  # noqa: E402
+                                stack_under_test)
 from sim_test_support import gz_link_poses  # noqa: E402
 
 PROFILE = "gazebo"
@@ -90,7 +97,7 @@ class TestLiftGuardGazebo(GuardCase, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        for k in ("pose_reaction", "base_reaction", "stale_reaction", "allow_within", "status_lag"):
+        for k in ("pose_reaction", "base_reaction", "stale_reaction", "allow_within", "status_lag", "warn_max"):
             setattr(cls.b, k, getattr(cls.b, k) * 2.0)
         cls.b.travel_after_violation = 0.015 * cls.b.pose_reaction + lift_still_m(PROFILE)
         cls.record["budgets_s"] = cls.b.as_dict()
@@ -120,6 +127,30 @@ class TestLiftGuardGazebo(GuardCase, unittest.TestCase):
         self.assertIsNotNone(dz, f"{what}: no ground truth for {CARRIAGE}")
         self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"{what}: the carriage moved {dz:.4f} m in the simulator")
         return round(dz, 5)
+
+    def test_g03_00_starts_blocked_and_allows_only_once_both_arms_are_parked(self):
+        name = "00_startup"
+        self.case(name)
+        z_start = carriage_z()
+        first_ok = self.p.wait_for(lambda: any(s["ok"] for _, s in self.p.status_changes), 120.0)
+        z_ok = carriage_z()
+        tl = self.p.timeline()
+        changes = list(self.p.status_changes)
+        self.assertTrue(changes, f"no message on {INTERFACE['status_topic']} since the launch")
+        self.assertFalse(changes[0][1]["ok"], f"the first status already allowed the lift: {changes[0][1]}")
+        self.assertIsNotNone(first_ok, "the guard never allowed the lift after start-up")
+        t_ok = next(t for t, s in changes if s["ok"])
+        active_before = [t for t, s in tl.controller if s == "active" and t < t_ok - 0.05]
+        devs = [d for t, d in tl.arms if t <= t_ok]
+        dz = None if None in (z_start, z_ok) else round(z_ok - z_start, 5)
+        self.case(name, first_status=changes[0][1], controller_active_before_first_ok=len(active_before),
+                  arm_deviation_at_first_ok=devs[-1] if devs else None, carriage_dz_before_first_ok_m=dz)
+        self.assertTrue(any(t < t_ok for t, _ in tl.controller), f"{LIFT_CONTROLLER}'s state was never observed before the first OK")
+        self.assertFalse(active_before, f"{LIFT_CONTROLLER} was active before the guard first allowed the lift (#44 acceptance 1)")
+        self.assertTrue(devs and max(devs[-1].values()) <= self.tol, f"first allowed with an arm out of park: {devs[-1] if devs else None}")
+        self.assertIsNotNone(dz, f"no ground truth for {CARRIAGE} at start-up")
+        self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"the carriage moved {dz:.4f} m in the simulator before the first OK")
+        self.passed(name)
 
     def test_g03_01_allowed_a_lift_goal_moves_the_carriage_in_the_simulator(self):
         name = "01_positive_control"
@@ -238,6 +269,70 @@ class TestLiftGuardGazebo(GuardCase, unittest.TestCase):
         self.assertLessEqual(abs(dz), lift_still_m(PROFILE), f"the carriage moved {dz:.4f} m while the base was driven")
         self.assertFalse(accepted, "lift_controller accepted a goal while the base was driven")
         self.assertIsNotNone(took, "no BASE_MOVING while the base was driven")
+        self.passed(name)
+
+    def park_errors(self, seconds):
+        """Sample /arm/joint_states for `seconds` at 50 Hz: {joint: max |position - park|} over the window (inf if never seen)."""
+        worst = {j: 0.0 for j in self.park}
+        seen = set()
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            with self.p.lock:
+                snap = {j: self.p.joints.get(j) for j in self.park}
+            for j, v in snap.items():
+                if v is not None:
+                    seen.add(j)
+                    worst[j] = max(worst[j], abs(v - self.park[j]))
+            time.sleep(0.02)
+        return {j: (round(worst[j], 6) if j in seen else math.inf) for j in self.park}
+
+    def test_g03_06_measure_the_settled_park_error(self):
+        name = "06_park_settled_error"
+        self.start(name)
+        rows = {}
+        time.sleep(2.0)
+        rows["at_rest"] = self.park_errors(3.0)
+        l0 = self.p.lift()
+        accepted, handle, seconds = self.p.lift_goal(l0 + 0.04)
+        rows["during_lift_move"] = self.park_errors(max(1.0, seconds))
+        if accepted:
+            self.p.result(handle, seconds + 10.0)
+            self.p.lift_goal_and_wait(l0)
+        stop = threading.Event()
+
+        def drive():
+            twist = Twist()
+            twist.linear.x = 0.2
+            while not stop.is_set():
+                self.cmd_vel.publish(twist)
+                time.sleep(0.05)
+            for _ in range(10):
+                self.cmd_vel.publish(Twist())
+                time.sleep(0.05)
+        driver = threading.Thread(target=drive, daemon=True)
+        driver.start()
+        try:
+            time.sleep(0.5)
+            rows["while_base_drives"] = self.park_errors(2.0)
+        finally:
+            stop.set()
+            driver.join(3.0)
+        for side in ARM_JOINTS:
+            self.p.arm_goal(side, self.far_out(side), seconds=2.0)
+            self.p.arm_goal(side, self.p.park_side(side), seconds=2.0)
+        time.sleep(2.0)
+        rows["after_out_and_back"] = self.park_errors(3.0)
+        summary = {}
+        for cond, errs in rows.items():
+            j = max(errs, key=errs.get)
+            summary[cond] = {"max_rad": errs[j], "joint": j}
+        self.case(name, lift_goal_accepted=accepted, tolerance_now=self.tol, summary=summary, per_joint=rows,
+                  note="input for the per-profile Gazebo stowed_tolerance (#44, 10 Nov); the margin is the guard owner's call")
+        self.assertTrue(all(math.isfinite(v["max_rad"]) for v in summary.values()), f"some arm joint never seen on the arm state: {summary}")
+        for cond in ("at_rest", "after_out_and_back"):
+            self.assertLessEqual(summary[cond]["max_rad"], self.tol,
+                                 f"{cond}: {summary[cond]['joint']} sits {summary[cond]['max_rad']} rad from park, outside the "
+                                 "guard's tolerance")
         self.passed(name)
 
     def test_g03_zz_safety_properties_held_throughout_the_run(self):

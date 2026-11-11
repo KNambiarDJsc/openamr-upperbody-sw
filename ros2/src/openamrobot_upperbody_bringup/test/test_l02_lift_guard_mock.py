@@ -19,13 +19,15 @@ Cases
   06 an arm goal executing but holding still (zero velocity, at park): blocked (the action condition alone sees it)
   07 an arm trajectory sent on the controller's TOPIC: blocked (no action exists, only the reference check sees it)
   08 arm out: the action is rejected, the topic does not move the lift up or down, and nothing replays after the arm is parked again
-  09 lift_controller activated from outside while blocked: deactivated again within the reaction budget; lift travel bounded
+  09 lift_controller activated from outside while blocked: deactivated again within the reaction budget, lift travel bounded, and every
+     status in the window is ERROR naming the cause (#44, 10 Nov: "blocking naming the cause")
   10 an arm leaves park during a lift move, up (left) and down (right): the lift stops within the travel budget, holds, does not resume
   11 arm state stops (joint_state_broadcaster deactivated): blocked with ARM_STATE_STALE or ARM_STATE_MISSING
   12 injected arm state: fresh and parked allows; one joint absent from every message blocks (freshness per joint); a NaN blocks
   13 MoveIt: a lift request through move_group with an arm out does not move the lift
   14 two reasons at once: both arms out gives both codes; parking one leaves the other
-  zz the safety properties P1-P6 held over the whole run
+  15 every stowed state the guard declares (stowed_states; park today, carry once Q7 adds it to the SRDF) allows the lift
+  zz the safety properties P1-P7 held over the whole run
 
 On main before the guard exists this FAILs by design (the red half of the #44 integration branch). Simulation only: it says nothing about
 the firmware interlock (CTL-017).
@@ -51,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # noqa: E402
 from lift_guard_oracle import first_crossing  # noqa: E402
 from lift_guard_support import (ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, LIFT, LIFT_CONTROLLER, START_HEIGHT, GuardCase,  # noqa: E402
-                                joint_limits, lift_still_m, stack_under_test)
+                                joint_limits, lift_still_m, srdf_states, stack_under_test)
 
 PROFILE = "mock"
 EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["process_pattern"]]
@@ -293,12 +295,16 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
         undone = self.p.wait_for(lambda: self.p.lift_controller_state() != "active", self.b.pose_reaction + 1.0)
         time.sleep(1.0)
         travel = self.p.lift_motion_since(t0)
+        window = [(round(t - t0, 3), level, list(codes)) for t, level, _, codes in self.p.timeline().status if t >= t0]
+        unnamed = [w for w in window if w[1] != 2 or "ARM_NOT_STOWED_LEFT" not in w[2]]
         self.case(name, blocked_before=blocked is not None, switch_ok=switched, undone_after_s=undone, travel_m=round(travel, 5),
-                  travel_budget_m=round(self.b.travel_after_violation, 4))
+                  travel_budget_m=round(self.b.travel_after_violation, 4), statuses_in_window=len(window), not_naming_the_cause=unnamed[:5])
         self.p.arm_goal("left", self.p.park_side("left"), seconds=1.5)
         self.assertIsNotNone(undone, f"{LIFT_CONTROLLER} stayed active after an outside activation with the left arm out")
         self.assertLessEqual(travel, self.b.travel_after_violation, f"the lift travelled {travel:.4f} m in the window")
         self.assertIsNotNone(blocked, "the guard was not blocking before the outside activation")
+        self.assertTrue(window, "no status at all in the window after the outside activation")
+        self.assertFalse(unnamed, f"a status in the window was not ERROR naming ARM_NOT_STOWED_LEFT: {unnamed[:3]}")
         self.passed(name)
 
     # ---- 10 mid-motion ----------------------------------------------------------------------------------------------------------------
@@ -432,6 +438,32 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
         self.passed(name)
 
     # ---- zz run-wide --------------------------------------------------------------------------------------------------------------------
+    # ---- 15 every stowed state ------------------------------------------------------------------------------------------------------
+    def test_l02_15_every_stowed_state_allows_the_lift(self):
+        name = "15_each_stowed_state"
+        self.start(name)
+        states, rows = srdf_states(), {}
+        for state in self.params["stowed_states"]:
+            poses = {side: states.get((state, f"{side}_arm")) for side in ARM_JOINTS}
+            if not all(poses.values()) or not all(all(j in poses[s] for j in ARM_JOINTS[s]) for s in ARM_JOINTS):
+                rows[state] = {"skipped": "not an SRDF group state of both arms"}
+                continue
+            for side in ARM_JOINTS:
+                self.p.arm_goal(side, [poses[side][j] for j in ARM_JOINTS[side]], seconds=2.0)
+            allowed = self.p.wait_allowed(self.b.allow_within)
+            l0 = self.p.lift()
+            accepted, _ = self.p.lift_goal_and_wait(l0 + 0.01)
+            rows[state] = {"allowed_after_s": allowed, "accepted": accepted, "moved_m": round(self.p.lift() - l0, 4)}
+        for side in ARM_JOINTS:
+            self.p.arm_goal(side, self.p.park_side(side), seconds=2.0)
+        self.case(name, stowed_states=list(self.params["stowed_states"]), rows=rows)
+        tried = {k: r for k, r in rows.items() if "skipped" not in r}
+        self.assertTrue(tried, f"no stowed state of {list(self.params['stowed_states'])} is an SRDF group state of both arms")
+        for state, r in tried.items():
+            self.assertIsNotNone(r["allowed_after_s"], f"both arms at stowed state {state!r}: the guard did not allow the lift")
+            self.assertGreater(r["moved_m"], 0.008, f"both arms at stowed state {state!r}: the lift did not move")
+        self.passed(name)
+
     def test_l02_zz_safety_properties_held_throughout_the_run(self):
         self.check_properties()
 

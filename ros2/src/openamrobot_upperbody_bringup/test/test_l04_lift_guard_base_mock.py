@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 """L04 (#44): the lift guard on `mock`: the base condition (odometry).
 
-mock has no base; the design starts a zero-odom stub with the guard, and the test publishes /odom beside it. The guard's rule is "base
-stopped CONTINUOUSLY for base_stopped_hold_s", so one moving sample among the stub's zeros must be enough to block, and nothing below the
-thresholds may block. The thresholds are read from the guard (base_linear_speed_max, base_angular_speed_max, base_stopped_hold_s).
+mock has no base; the design starts a zero-odom stub with the guard. Decided on #44 (10 Nov): the stub takes std_srvs/SetBool on
+/lift_guard_odom_stub/enable and a velocity parameter, mock only. Base motion goes through that parameter when the stub has it (one source
+of /odom, as the guard sees on a real base); otherwise the test publishes /odom beside the stub, where the guard's rule "stopped
+CONTINUOUSLY for base_stopped_hold_s" must still block on one moving sample among the stub's zeros. Each case records which method it
+used. A NaN twist is always injected: it models a corrupted message, not a base. The thresholds are read from the guard
+(base_linear_speed_max, base_angular_speed_max, base_stopped_hold_s); the hold time is measured from the last moving sample seen on /odom.
 
 Cases (each from: both arms parked, lift at 0.10 m)
   01 linear speed at 0.8x the threshold stays allowed and the lift moves; at 1.2x it blocks with BASE_MOVING and neither path moves the lift
@@ -57,7 +60,8 @@ class TestLiftGuardBaseMock(GuardCase, unittest.TestCase):
         limit = float(self.params[name])
         rows = {"threshold": limit}
         # just below: every sample under the threshold, so nothing may block, and the lift must move
-        with self.p.inject_odom(linear=0.8 * limit if linear else 0.0, angular=0.0 if linear else 0.8 * limit):
+        with self.p.base_motion(linear=0.8 * limit if linear else 0.0, angular=0.0 if linear else 0.8 * limit) as how:
+            rows["method"] = how["method"]
             time.sleep(0.5)
             rows["below_stays_allowed"] = self.p.stays(
                 lambda: (self.p.current_status() or {}).get("ok") and self.p.lift_controller_state() == "active", 2.0)
@@ -66,7 +70,7 @@ class TestLiftGuardBaseMock(GuardCase, unittest.TestCase):
             rows["below_moved_m"] = round(self.p.lift() - l0, 4)
         self.p.wait_allowed(self.b.allow_within)
         # just above
-        with self.p.inject_odom(linear=1.2 * limit if linear else 0.0, angular=0.0 if linear else 1.2 * limit):
+        with self.p.base_motion(linear=1.2 * limit if linear else 0.0, angular=0.0 if linear else 1.2 * limit):
             rows["above_blocked_after_s"] = self.p.wait_blocked("BASE_MOVING", timeout=self.b.base_reaction)
             accepted, t0 = self.try_lift_both_paths(0.03)
             rows["above_action_accepted"] = accepted
@@ -114,13 +118,17 @@ class TestLiftGuardBaseMock(GuardCase, unittest.TestCase):
         name = "04_hold_time"
         self.start(name)
         hold = float(self.params["base_stopped_hold_s"])
-        with self.p.inject_odom(linear=1.2 * float(self.params["base_linear_speed_max"])) as sent:
+        lin_max, ang_max = float(self.params["base_linear_speed_max"]), float(self.params["base_angular_speed_max"])
+        t_start = time.monotonic()
+        with self.p.base_motion(linear=1.2 * lin_max) as how:
             self.p.wait_blocked("BASE_MOVING", timeout=self.b.base_reaction)
             time.sleep(1.0)
-        t_last = sent["last"]
         took = self.p.wait_allowed(hold + self.b.allow_within)
-        since_last = None if took is None else round(time.monotonic() - t_last, 3)
-        self.case(name, hold_s=hold, allowed_after_last_moving_sample_s=since_last)
+        t_allowed = time.monotonic()
+        t_last = self.p.last_moving_odom(lin_max, ang_max, after=t_start)
+        since_last = None if took is None or t_last is None else round(t_allowed - t_last, 3)
+        self.case(name, method=how["method"], hold_s=hold, allowed_after_last_moving_sample_s=since_last)
+        self.assertIsNotNone(t_last, "no moving sample was ever seen on /odom (precondition)")
         self.assertIsNotNone(since_last, "never allowed after the base stopped")
         self.assertGreaterEqual(since_last, hold - 0.05, f"allowed {since_last:.2f} s after the last moving sample, before the hold of "
                                                        f"{hold:.2f} s")
@@ -133,7 +141,7 @@ class TestLiftGuardBaseMock(GuardCase, unittest.TestCase):
         far = self.p.park_side("left")
         far[3] = 1.5
         self.p.arm_goal("left", far, seconds=1.5)
-        with self.p.inject_odom(linear=0.2):
+        with self.p.base_motion(linear=0.2):
             both = self.p.wait_for(lambda: self.p.blocked("BASE_MOVING") and self.p.blocked("ARM_NOT_STOWED_LEFT"), self.b.base_reaction)
         arm_only = self.p.wait_for(lambda: self.p.blocked("ARM_NOT_STOWED_LEFT") and not self.p.blocked("BASE_MOVING"),
                                    float(self.params["base_stopped_hold_s"]) + self.b.allow_within)

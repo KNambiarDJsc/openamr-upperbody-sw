@@ -40,19 +40,26 @@ from lift_guard_oracle import Timeline, arm_deviation
 INTERFACE = {
     "status_topic": "/lift_guard/status",
     "status_name": "lift_guard",
-    "key_controller": "lift_controller",      # value: active | inactive
+    "key_controller": "lift_controller",      # value: active | inactive | activating (WARN, switching on; #44 decision of 10 Nov)
     "key_blocking": "blocking",               # value: comma-separated codes, empty when OK
     "process_pattern": "lift_guard",          # how the kill test finds the guard process
-    # PROPOSED on #44, not agreed yet: a way for a test to stop the mock zero-odom stub. The odom-loss cases skip while it is absent.
+    # The mock zero-odom stub (#44 decision of 10 Nov: std_srvs/SetBool on this service, and a velocity parameter, mock only). The
+    # service name is agreed; the node and parameter NAMES below are proposed by these tests, to confirm with the guard's author.
+    # Without them the odom-loss case skips and base motion is injected on /odom beside the stub.
     "odom_stub_enable_service": "/lift_guard_odom_stub/enable",
+    "odom_stub_node": "/lift_guard_odom_stub",
+    "odom_stub_velocity_parameters": ("linear_x", "angular_z"),   # m/s along x, rad/s about z, published in the twist
 }
 CODES = ("ARM_NOT_STOWED_LEFT", "ARM_NOT_STOWED_RIGHT", "ARM_TRAJECTORY_ACTIVE_LEFT", "ARM_TRAJECTORY_ACTIVE_RIGHT", "ARM_STATE_MISSING",
          "ARM_STATE_STALE", "BASE_MOVING", "ODOM_MISSING", "ODOM_STALE", "SWITCH_FAILED")
 PARAMETERS = ("stowed_states", "stowed_tolerance", "reference_velocity_max", "arm_state_topic", "odom_topic", "base_linear_speed_max",
               "base_angular_speed_max", "base_stopped_hold_s", "state_timeout_s", "status_rate_hz")
+# Read when the guard declares them, not part of the posted interface: #53 times out a switch request after switch_timeout_s (+1 s).
+OPTIONAL_PARAMETERS = ("switch_timeout_s",)
 # The design's provisional defaults (#44): used only when the guard's own parameters cannot be read. Not firmware values (#20).
 PROVISIONAL = {"stowed_states": ["park"], "stowed_tolerance": 0.01, "reference_velocity_max": 0.001, "base_linear_speed_max": 0.01,
-               "base_angular_speed_max": 0.01, "base_stopped_hold_s": 0.5, "state_timeout_s": 0.5, "status_rate_hz": 10.0}
+               "base_angular_speed_max": 0.01, "base_stopped_hold_s": 0.5, "state_timeout_s": 0.5, "status_rate_hz": 10.0,
+               "switch_timeout_s": 2.0}
 
 LIFT = "lift_joint"
 LIFT_CONTROLLER = "lift_controller"
@@ -92,9 +99,21 @@ class Budgets:
         self.status_lag = 2 * tick + 0.3
         self.settle = 0.3 if profile == "mock" else 0.6                                     # after a block, before "did not move" applies
         self.travel_after_violation = LIFT_SPEED * self.pose_reaction + lift_still_m(profile)
+        # WARN ("activating") must end: OK, or ERROR with SWITCH_FAILED once the guard's own switch timeout has run out
+        self.warn_max = (float(params.get("switch_timeout_s", 2.0)) + 1.0 + 2 * tick + SWITCH_S) * SLACK
+        # The stopping budget after the guard dies is NOT set yet: #44 (10 Nov) and Evans: it comes from the lift speed in platform-fw #20,
+        # and the 19-30 mm measured on #53 is not acceptable as the final number. Until it is set, the kill test reports the measurement
+        # and skips the budget check visibly instead of passing it.
+        self.stop_budget_s = _env_float("OPENAMR_LIFT_GUARD_STOP_BUDGET_S")
+        self.stop_budget_m = _env_float("OPENAMR_LIFT_GUARD_STOP_BUDGET_M")
 
     def as_dict(self):
-        return {k: round(v, 3) for k, v in vars(self).items()}
+        return {k: round(v, 3) if isinstance(v, (int, float)) else v for k, v in vars(self).items()}
+
+
+def _env_float(name):
+    value = os.environ.get(name)
+    return float(value) if value not in (None, "") else None
 
 
 def dur(seconds):
@@ -110,7 +129,8 @@ def parse_status(msg):
     values = {kv.key: kv.value for kv in msg.values}
     blocking = tuple(c for c in values.get(INTERFACE["key_blocking"], "").split(",") if c)
     level = level_int(msg.level)
-    return {"level": level, "ok": level == level_int(DiagnosticStatus.OK), "controller": values.get(INTERFACE["key_controller"]),
+    return {"level": level, "ok": level == level_int(DiagnosticStatus.OK), "warn": level == level_int(DiagnosticStatus.WARN),
+            "error": level == level_int(DiagnosticStatus.ERROR), "controller": values.get(INTERFACE["key_controller"]),
             "blocking": blocking, "message": msg.message, "name": msg.name, "keys": sorted(values)}
 
 
@@ -145,6 +165,7 @@ class GuardProbe:
         self.ctl_counts = {"activity_events": 0, "polls_applied": 0, "polls_dropped": 0, "polls_without_lift": 0}
         self.t_created = time.monotonic()
         self.receipt_lags = []                      # s between a JointState's stamp and its receipt here (mock only)
+        self.odom_samples = []                      # (t, |linear|, |angular|) of every /odom seen, for the hold-time measurement
         self.params, self.params_source = dict(PROVISIONAL), "provisional (guard parameters not read yet)"
         self.state_timeout = PROVISIONAL["state_timeout_s"]
 
@@ -152,6 +173,7 @@ class GuardProbe:
         self.node.create_subscription(DiagnosticStatus, INTERFACE["status_topic"], self._on_status, latched)
         self.node.create_subscription(JointState, arm_state_topic(profile), self._on_joints, 100)
         self.node.create_subscription(ControllerManagerActivity, "/controller_manager/activity", self._on_activity, 10)
+        self.node.create_subscription(Odometry, "/odom", self._on_odom, 100)
         self.lift_ac = ActionClient(self.node, FollowJointTrajectory, f"/{LIFT_CONTROLLER}/follow_joint_trajectory")
         self.arm_ac = {s: ActionClient(self.node, FollowJointTrajectory, f"/{s}_arm_controller/follow_joint_trajectory") for s in ARM_JOINTS}
         self.lift_topic = self.node.create_publisher(JointTrajectory, f"/{LIFT_CONTROLLER}/joint_trajectory", 10)
@@ -206,6 +228,22 @@ class GuardProbe:
             if prev is None or (parsed["ok"], parsed["controller"], parsed["blocking"]) != (prev["ok"], prev["controller"], prev["blocking"]):
                 self.status_changes.append((now, parsed))
 
+    def _on_odom(self, msg):
+        tw = msg.twist.twist
+        lin = math.sqrt(tw.linear.x ** 2 + tw.linear.y ** 2 + tw.linear.z ** 2)
+        ang = math.sqrt(tw.angular.x ** 2 + tw.angular.y ** 2 + tw.angular.z ** 2)
+        with self.lock:
+            self.odom_samples.append((time.monotonic(), lin, ang))
+            del self.odom_samples[:-20000]
+
+    def last_moving_odom(self, linear_max, angular_max, after=0.0):
+        """Receipt time of the last /odom sample at or above a threshold (or non-finite) after `after`, or None."""
+        with self.lock:
+            samples = list(self.odom_samples)
+        moving = [t for t, lin, ang in samples
+                  if t >= after and (not math.isfinite(lin) or not math.isfinite(ang) or lin >= linear_max or ang >= angular_max)]
+        return moving[-1] if moving else None
+
     def _set_ctl(self, state, now, polled_since=None):
         """`polled_since`: a list_controllers answer to a request sent then. It is dropped if an activity event arrived after the request:
         the answer may describe the manager before that event (PR #53 run, 10 Nov: a stale 'inactive' landed after the activation event)."""
@@ -250,7 +288,8 @@ class GuardProbe:
 
     def timeline(self):
         with self.lock:
-            tl = Timeline(lift=sorted(self.tl.lift, key=lambda e: e[0]), arms=sorted(self.tl.arms, key=lambda e: e[0]), status=list(self.tl.status),
+            tl = Timeline(lift=sorted(self.tl.lift, key=lambda e: e[0]), arms=sorted(self.tl.arms, key=lambda e: e[0]),
+                          status=list(self.tl.status),
                           controller=list(self.tl.controller), marks=list(self.tl.marks))
         tl.end = time.monotonic()
         return tl
@@ -277,12 +316,12 @@ class GuardProbe:
         if not client.wait_for_services(timeout_sec=max(0.5, deadline - time.monotonic())):
             self.params_source = f"provisional ({name}: no parameter services)"
             return False
-        fut = client.get_parameters(list(PARAMETERS))
+        fut = client.get_parameters(list(PARAMETERS) + list(OPTIONAL_PARAMETERS))
         if self.wait_for(fut.done, 5.0) is None or fut.result() is None:
             self.params_source = f"provisional ({name}: get_parameters did not answer)"
             return False
         read = {}
-        for pname, value in zip(PARAMETERS, fut.result().values):
+        for pname, value in zip(list(PARAMETERS) + list(OPTIONAL_PARAMETERS), fut.result().values):
             v = parameter_value_to_python(value)
             if v is not None:
                 read[pname] = v
@@ -335,7 +374,7 @@ class GuardProbe:
 
     def blocked(self, code=None, any_of=None):
         s = self.current_status()
-        if s is None or s["ok"] or not s["blocking"]:    # ERROR with no code = allowed, lift_controller not active yet (PR #53)
+        if s is None or not s["error"]:                  # ERROR always means blocked (#44, 10 Nov); WARN is switching on
             return False
         if code is not None and code not in s["blocking"]:
             return False
@@ -490,6 +529,38 @@ class GuardProbe:
             stop.set()
             th.join(2.0)
 
+    def odom_stub_velocity(self, linear, angular, timeout=3.0):
+        """Set the mock stub's velocity parameters (INTERFACE). -> True, or None if the stub has no such parameters."""
+        from rcl_interfaces.srv import SetParameters
+        from rclpy.parameter import Parameter
+        cli = self.node.create_client(SetParameters, INTERFACE["odom_stub_node"] + "/set_parameters")
+        try:
+            if not cli.wait_for_service(timeout_sec=timeout):
+                return None
+            names = INTERFACE["odom_stub_velocity_parameters"]
+            req = SetParameters.Request(parameters=[Parameter(n, value=float(v)).to_parameter_msg() for n, v in zip(names, (linear, angular))])
+            fut = cli.call_async(req)
+            if self.wait_for(fut.done, timeout) is None or fut.result() is None:
+                return None
+            return True if all(r.successful for r in fut.result().results) else None
+        finally:
+            self.node.destroy_client(cli)
+
+    @contextlib.contextmanager
+    def base_motion(self, linear=0.0, angular=0.0):
+        """The base 'moving' with this twist while the block runs. Through the mock stub's velocity parameters when it has them (#44,
+        10 Nov), so the guard sees one source of /odom; otherwise published on /odom beside the stub (which the guard's 'stopped
+        continuously for the hold time' rule must also handle). -> {"method": "stub" | "injected"}"""
+        if self.odom_stub_velocity(linear, angular):
+            try:
+                yield {"method": "stub"}
+            finally:
+                self.odom_stub_velocity(0.0, 0.0)
+        else:
+            with self.inject_odom(linear=linear, angular=angular) as sent:
+                sent["method"] = "injected"
+                yield sent
+
     def odom_stub(self, enable, timeout=3.0):
         """The PROPOSED stub switch (INTERFACE['odom_stub_enable_service']). -> True/False, or None if the service does not exist."""
         from std_srvs.srv import SetBool
@@ -592,7 +663,8 @@ class GuardCase:
         t0 = cls.p.status_changes[0][0] if cls.p.status_changes else cls.p.t_created
         cls.record["controller_recording"] = {**cls.p.ctl_counts, "probe_created_s": round(cls.p.t_created - t0, 3),
                                               "first_entries": [(round(t - t0, 3), st) for t, st in cls.p.tl.controller[:12]]}
-        cls.record["arm_state_receipt_lag_s"] = {"samples": len(lags), "p50": round(lags[len(lags) // 2], 4), "p99": round(lags[int(len(lags) * 0.99)], 4),
+        cls.record["arm_state_receipt_lag_s"] = {"samples": len(lags), "p50": round(lags[len(lags) // 2], 4),
+                                                 "p99": round(lags[int(len(lags) * 0.99)], 4),
                                                  "max": round(lags[-1], 4)} if lags else None
         write_run_sidecar(cls.CHECK_ID, cls.SLUG, cls.NAME, "PASS" if ok else "FAIL", jsonable(cls.record))
         cls.p.close()
@@ -652,7 +724,7 @@ class GuardCase:
     def check_properties(self):
         from lift_guard_oracle import evaluate
         result = evaluate(self.p.timeline(), tolerance=self.tol, known_codes=CODES, settle=self.b.settle, eps=lift_still_m(self.PROFILE),
-                          reaction=self.b.pose_reaction, lag=self.b.status_lag)
+                          reaction=self.b.pose_reaction, lag=self.b.status_lag, warn_max=self.b.warn_max)
         self.record["properties"] = {k: {"violations": len(v), "first": v[:5]} for k, v in result.items()}
         broken = {k: v[:3] for k, v in result.items() if v}
         self.assertFalse(broken, f"safety properties broken during the run: {broken}")

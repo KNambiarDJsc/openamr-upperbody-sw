@@ -6,15 +6,22 @@ No ROS here: the functions take plain time series (wall seconds, monotonic) so t
 
 Properties (each returns a list of violations, empty when it holds):
 
-  P1 no_motion_while_blocked      while the guard reports ERROR, lift_joint does not move (after `settle` s from the change)
+  P1 no_motion_while_blocked      while the guard reports ERROR (always "blocked", #44 decision of 10 Nov), lift_joint does not move
+                                  (after `settle` s from the change)
   P2 no_motion_while_inactive     while lift_controller is not active, lift_joint does not move (after `settle` s)
   P3 arm_out_is_blocked           whenever an arm joint is outside the stowed tolerance (or unreadable) for longer than `reaction` s, the
-                                  guard reports ERROR with that arm's code, and lift_controller is not active. This is the test's own oracle,
+                                  guard reports ERROR with that arm's code (OK or WARN is a breach), and lift_controller is not active. This
+                                  is the test's own oracle,
                                   computed from the joint states it sees, independent of the guard: a guard that allows the lift for a moment
                                   anywhere in the run is caught, not only where a case looks
-  P4 status_contract              every status: level OK or ERROR only; OK iff no blocking codes; codes from the published set only
-  P5 status_matches_controller    the status's lift_controller value agrees with the controller manager within `lag` s
-  P6 allowed_means_active         a status of OK with lift_controller inactive (or ERROR with it active) does not persist beyond `lag` s
+  P4 status_contract              the agreed contract (#44, 10 Nov): OK = nothing blocks and lift_controller active; WARN = nothing blocks,
+                                  lift_controller "activating" (switching on); ERROR = blocked, with at least one code; codes from the
+                                  published set only; lift_controller one of active, inactive, activating
+  P5 status_matches_controller    the status's lift_controller value agrees with the controller manager within `lag` s ("activating"
+                                  counts as not active yet)
+  P6 allowed_means_active         OK with lift_controller inactive, or ERROR with it active, does not persist beyond `lag` s
+  P7 switching_on_is_brief        WARN ("activating") is transitional: each WARN spell ends within `warn_max` s (OK, or ERROR with
+                                  SWITCH_FAILED). Spells before lift_controller is first seen at all (still being loaded) are not counted
 
 What these are not: they say nothing about the firmware interlock (CTL-017), and they only see what the test process sees (the guard may
 have seen a message the test missed, and the other way round; the reaction windows absorb that).
@@ -22,7 +29,8 @@ have seen a message the test missed, and the other way round; the reaction windo
 import math
 from dataclasses import dataclass, field
 
-OK, ERROR = 0, 2           # diagnostic_msgs/DiagnosticStatus levels the guard may use
+OK, WARN, ERROR = 0, 1, 2  # diagnostic_msgs/DiagnosticStatus levels the guard may use
+CONTROLLER_VALUES = ("active", "inactive", "activating")
 
 
 @dataclass
@@ -80,9 +88,8 @@ def _value_at(events, t, index=1, default=None):
 
 
 def no_motion_while_blocked(tl, settle, eps):
-    # Blocked = a status with a blocking code. ERROR with no code is "allowed, lift_controller not active yet" (PR #53); P5 covers a guard
-    # that reports that while the controller is in fact active.
-    blocked = shrink(step_intervals(tl.status, lambda e: e[1] != OK and len(e[3]) > 0, tl.end), settle)
+    # ERROR always means blocked (#44 decision of 10 Nov). WARN ("activating") is not blocked; P4 makes sure it carries no code.
+    blocked = shrink(step_intervals(tl.status, lambda e: e[1] == ERROR, tl.end), settle)
     return [{"property": "P1", "from": a, "to": b, "moved_m": m, "case": label_at(tl, a)}
             for a, b in blocked for m in [lift_motion(tl.lift, a, b)] if m > eps]
 
@@ -101,10 +108,11 @@ def arm_out_is_blocked(tl, tolerance, reaction, sides=("left", "right")):
         code = f"ARM_NOT_STOWED_{side.upper()}"
         alt = (code, f"ARM_TRAJECTORY_ACTIVE_{side.upper()}", "ARM_STATE_MISSING", "ARM_STATE_STALE")
         for a, b in shrink(step_intervals(tl.arms, lambda e: e[1][side] > tolerance * 1.05, tl.end), reaction):
-            if _value_at(tl.status, a, index=1) == OK:
-                out.append({"property": "P3", "side": side, "at": a, "level": OK, "codes": [], "case": label_at(tl, a)})
+            if _value_at(tl.status, a, index=1) in (OK, WARN):
+                out.append({"property": "P3", "side": side, "at": a, "level": _value_at(tl.status, a, index=1), "codes": [],
+                            "case": label_at(tl, a)})
             for t, level, ctl, codes in tl.status:
-                if a <= t <= b and (level == OK or not any(c in codes for c in alt)):
+                if a <= t <= b and (level != ERROR or not any(c in codes for c in alt)):
                     out.append({"property": "P3", "side": side, "at": t, "level": level, "codes": list(codes), "case": label_at(tl, t)})
                     break
             # lift_controller may be active inside the interval only briefly: an outside activation the guard undoes within `reaction`.
@@ -122,21 +130,27 @@ def arm_out_is_blocked(tl, tolerance, reaction, sides=("left", "right")):
 
 
 def status_contract(tl, known_codes):
+    """P4, the contract agreed on #44 (10 Nov): OK = nothing blocks and lift_controller active; WARN = nothing blocks, lift_controller
+    "activating"; ERROR = blocked, with at least one code."""
     out = []
     for t, level, ctl, codes in tl.status:
         problems = []
-        if level not in (OK, ERROR):
-            problems.append(f"level {level} is neither OK nor ERROR")
-        if level == OK and codes:
-            problems.append(f"OK with blocking codes {list(codes)}")
-        # ERROR with no code is the guard's "nothing blocks, lift_controller not active yet" (PR #53 build_status): legitimate only while
-        # it reports lift_controller inactive. A guard stuck there fails the cases (wait_allowed), not this property.
-        if level == ERROR and not codes and ctl != "inactive":
-            problems.append(f"ERROR with no blocking code while lift_controller is reported {ctl!r}")
+        if level not in (OK, WARN, ERROR):
+            problems.append(f"level {level} is not OK, WARN or ERROR")
+        if level in (OK, WARN) and codes:
+            problems.append(f"level {level} with blocking codes {list(codes)}")
+        if level == OK and ctl != "active":
+            problems.append(f"OK while lift_controller is reported {ctl!r}")
+        if level == WARN and ctl != "activating":
+            problems.append(f"WARN while lift_controller is reported {ctl!r} (WARN is the 'activating' state)")
+        if level == ERROR and not codes:
+            problems.append("ERROR with no blocking code (ERROR always means blocked, and blocking names the cause)")
+        if level == ERROR and ctl == "activating":
+            problems.append("ERROR while lift_controller is reported 'activating'")
         unknown = [c for c in codes if c not in known_codes]
         if unknown:
             problems.append(f"unknown codes {unknown}")
-        if ctl not in ("active", "inactive"):
+        if ctl not in CONTROLLER_VALUES:
             problems.append(f"lift_controller value {ctl!r}")
         if problems:
             out.append({"property": "P4", "at": t, "problems": problems, "case": label_at(tl, t)})
@@ -151,8 +165,9 @@ def status_matches_controller(tl, lag):
 
     out = []
     for t, level, ctl, codes in tl.status:
-        if ctl not in ("active", "inactive"):
+        if ctl not in CONTROLLER_VALUES:
             continue
+        ctl = "inactive" if ctl == "activating" else ctl     # switching on: not active yet
         window = {norm(_value_at(tl.controller, t - lag))} | {norm(s) for tc, s in tl.controller if t - lag <= tc <= t + lag}
         window.discard(None)
         if window and ctl not in window:
@@ -161,8 +176,8 @@ def status_matches_controller(tl, lag):
 
 
 def allowed_means_active(tl, lag):
-    """P6: OK must come with lift_controller active, ERROR with a blocking code with it inactive, apart from transitions shorter than `lag`.
-    ERROR with no code (allowed, not active yet) asks nothing of the controller: an activation the guard has not seen yet is not a breach."""
+    """P6: OK must come with lift_controller active, ERROR with it inactive, apart from transitions shorter than `lag`. WARN (switching on)
+    asks nothing of the controller here: an activation the guard has not seen yet is not a breach, and P7 bounds how long WARN lasts."""
     def reached(t, want_active):
         """lift_controller was in the wanted state at t, or got there at some moment in (t, t + lag]."""
         def ok(state):
@@ -173,12 +188,26 @@ def allowed_means_active(tl, lag):
     for t, level, ctl, codes in tl.status:
         if level == OK and not reached(t, True):
             out.append({"property": "P6", "at": t, "status": "OK", "controller": _value_at(tl.controller, t + lag), "case": label_at(tl, t)})
-        if level == ERROR and codes and not reached(t, False):
+        if level == ERROR and not reached(t, False):
             out.append({"property": "P6", "at": t, "status": "ERROR", "controller": _value_at(tl.controller, t + lag), "case": label_at(tl, t)})
     return out
 
 
-def evaluate(tl, *, tolerance, known_codes, settle, eps, reaction, lag):
+def switching_on_is_brief(tl, warn_max):
+    """P7: every WARN spell (consecutive WARN statuses) ends within `warn_max` s. Clipped to start no earlier than the first observation of
+    lift_controller: before the controller manager has even loaded it, 'activating' can legitimately last as long as start-up does."""
+    first_seen = tl.controller[0][0] if tl.controller else None
+    out = []
+    if first_seen is None:
+        return out
+    for a, b in step_intervals(tl.status, lambda e: e[1] == WARN, tl.end):
+        a = max(a, first_seen)
+        if b - a > warn_max:
+            out.append({"property": "P7", "from": a, "to": b, "for_s": round(b - a, 3), "case": label_at(tl, a)})
+    return out
+
+
+def evaluate(tl, *, tolerance, known_codes, settle, eps, reaction, lag, warn_max=10.0):
     """All properties; {property: [violations]}."""
     return {
         "P1_no_motion_while_blocked": no_motion_while_blocked(tl, settle, eps),
@@ -187,6 +216,7 @@ def evaluate(tl, *, tolerance, known_codes, settle, eps, reaction, lag):
         "P4_status_contract": status_contract(tl, known_codes),
         "P5_status_matches_controller": status_matches_controller(tl, lag),
         "P6_allowed_means_active": allowed_means_active(tl, lag),
+        "P7_switching_on_is_brief": switching_on_is_brief(tl, warn_max),
     }
 
 

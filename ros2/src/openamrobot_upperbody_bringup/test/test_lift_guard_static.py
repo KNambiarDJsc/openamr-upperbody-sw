@@ -5,6 +5,8 @@ or lift_controller's config"), checked on the source tree. No ROS graph.
 1. Both simulated launches start the guard and spawn lift_controller with --inactive (#44 acceptance 1: it starts inactive).
 2. No other launch file of the five packages starts it (moveit.launch.py may name the status topic: the start-up goal waits for it).
 3. The real profile's ros2_control description is untouched by the guard (it never mentions it).
+4. The zero-odom stub is started by the mock profile only (#44, 10 Nov: "mock only"; Gazebo has a simulated base whose /odom the guard
+   reads, and the real profile has a real one). Assumes the stub's name contains "odom_stub", as on #44.
 
 Text checks, deliberately simple: they say where the guard is wired, not that it works (L02-L05 and G03 do that). On main they FAIL by design.
 """
@@ -18,6 +20,8 @@ PACKAGES = [f"openamrobot_upperbody_{name}" for name in ("description", "control
 SIM_LAUNCHES = {"mock": ("openamrobot_upperbody_bringup", "mock.launch.py"), "gazebo": ("openamrobot_upperbody_gazebo", "sim.launch.py")}
 GUARD = re.compile(r"lift_guard")
 STATUS_ONLY = re.compile(r"/lift_guard/status")
+ODOM_STUB = re.compile(r"odom_stub")
+MOCK_LAUNCH = "openamrobot_upperbody_bringup/launch/mock.launch.py"
 
 
 def read(*parts):
@@ -64,3 +68,9 @@ def test_the_real_profile_description_does_not_mention_the_guard():
     urdf = os.path.join(SRC, "openamrobot_upperbody_description", "urdf")
     hits = [n for n in sorted(os.listdir(urdf)) if n.endswith(".xacro") and GUARD.search(read("openamrobot_upperbody_description", "urdf", n))]
     assert not hits, f"the description (shared by the real profile) mentions the guard: {hits}"
+
+
+def test_the_zero_odom_stub_is_started_by_the_mock_profile_only():
+    hits = [f"{p}/launch/{n}" for p, n in launch_files() if ODOM_STUB.search(read(p, "launch", n))]
+    assert hits, "no launch file starts the zero-odom stub: mock has no base, so without it the guard blocks the lift for ever"
+    assert set(hits) <= {MOCK_LAUNCH}, f"the zero-odom stub is started outside the mock profile (#44: mock only): {hits}"
