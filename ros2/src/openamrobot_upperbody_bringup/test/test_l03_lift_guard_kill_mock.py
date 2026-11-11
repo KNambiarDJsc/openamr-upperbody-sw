@@ -206,6 +206,7 @@ class TestLiftGuardDies(GuardCase, unittest.TestCase):
 
     def test_l03_2_stopping_within_the_budget(self):
         """Skips, with the measurement in the reason, until the budget from platform-fw #20 is set in the environment."""
+        self.require_guard_parameters()
         m = type(self).measured
         budget = {"s": self.b.stop_budget_s, "m": self.b.stop_budget_m}
         self.record["stopping_budget"] = {**budget, "source": "environment" if any(v is not None for v in budget.values())

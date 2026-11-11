@@ -74,6 +74,46 @@ SLACK = float(os.environ.get("OPENAMR_LIFT_GUARD_SLACK", "1.5"))   # multiplies 
 STATUS_NAMES = {v: k for k, v in GoalStatus.__dict__.items() if k.startswith("STATUS_")}
 
 
+POSITIVE_NUMBERS = ("stowed_tolerance", "reference_velocity_max", "base_linear_speed_max", "base_angular_speed_max", "base_stopped_hold_s",
+                    "state_timeout_s", "status_rate_hz")
+
+
+def parameter_problems(read, unavailable=None, known_states=None):
+    """Why the run cannot count as acceptance of the guard's configuration: [] only when every required parameter (PARAMETERS) was read
+    from the running guard and has a usable value (PR #60 review: never pass on provisional values).
+
+    `read`: {name: value} as read from the guard, or None when nothing could be read (`unavailable` says why). `known_states`: the SRDF
+    group states that exist for BOTH arms; when given, every name in stowed_states must be one of them."""
+    if read is None:
+        return [unavailable or "the guard's parameters could not be read"]
+    problems = [f"{name}: not set on the guard" for name in PARAMETERS if name not in read]
+    problems += [p for p in (value_problem(name, v) for name, v in read.items()) if p]
+    if known_states is not None and not value_problem("stowed_states", read.get("stowed_states")):
+        unknown = [x for x in read["stowed_states"] if x not in known_states]
+        if unknown:
+            problems.append(f"stowed_states {unknown}: not SRDF group states of both arms")
+    return problems
+
+
+def value_problem(name, v):
+    """What is wrong with one parameter value, or None if it is usable."""
+    if name in POSITIVE_NUMBERS + OPTIONAL_PARAMETERS:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            return f"{name} = {v!r}: not a finite number > 0"
+    elif name == "stowed_states":
+        if isinstance(v, str) or not isinstance(v, (list, tuple)) or not v or not all(isinstance(x, str) and x for x in v):
+            return f"stowed_states = {v!r}: not a non-empty list of state names"
+    elif name in ("arm_state_topic", "odom_topic"):
+        if not isinstance(v, str) or not v.strip():
+            return f"{name} = {v!r}: not a topic name"
+    return None
+
+
+def srdf_states_of_both_arms(states):
+    """Names of the group states that exist for left_arm AND right_arm in srdf_states()."""
+    return {name for (name, group) in states if group == "left_arm"} & {name for (name, group) in states if group == "right_arm"}
+
+
 def lift_still_m(profile):
     """How far lift_joint may move and still count as 'did not move'. mock reflects commands exactly; Gazebo settled 0.14 to 1.8 mm on a
     cancel or a re-activation in the #44 baseline."""
@@ -167,6 +207,7 @@ class GuardProbe:
         self.receipt_lags = []                      # s between a JointState's stamp and its receipt here (mock only)
         self.odom_samples = []                      # (t, |linear|, |angular|) of every /odom seen, for the hold-time measurement
         self.params, self.params_source = dict(PROVISIONAL), "provisional (guard parameters not read yet)"
+        self.params_read, self.params_unavailable = None, "the guard's parameters were not read"   # see parameter_problems()
         self.state_timeout = PROVISIONAL["state_timeout_s"]
 
         latched = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -296,14 +337,19 @@ class GuardProbe:
 
     # ---- the guard's parameters ---------------------------------------------------------------------------------------------------------
     def read_guard_parameters(self, timeout=10.0):
-        """Fill self.params from the running guard. -> True if read. Falls back to PROVISIONAL (recorded in params_source)."""
+        """Fill self.params from the running guard. -> True if read. Whatever could not be read stays PROVISIONAL so that a baseline can
+        still run (main has no guard), but such a run is not acceptance: self.params_read / params_unavailable feed parameter_problems(),
+        and GuardCase fails every case and the properties while it reports a problem."""
         from rclpy.parameter import parameter_value_to_python
         from rclpy.parameter_client import AsyncParameterClient
         deadline = time.monotonic() + timeout
         name = None
         # The guard is the node that PUBLISHES its status. (Matching node names was wrong: this test's own node is called l02_lift_guard.)
         while time.monotonic() < deadline and name is None:
-            pubs = [i for i in self.node.get_publishers_info_by_topic(INTERFACE["status_topic"]) if i.node_name != self.node.get_name()]
+            # An endpoint can be discovered before its node's name: "_NODE_NAME_UNKNOWN_" is not a guard to ask (11 Nov, found by the
+            # acceptance gate: asking it failed and the run fell back to provisional values).
+            pubs = [i for i in self.node.get_publishers_info_by_topic(INTERFACE["status_topic"])
+                    if i.node_name != self.node.get_name() and "_UNKNOWN_" not in i.node_name and "_UNKNOWN_" not in i.node_namespace]
             if pubs:
                 ns = pubs[0].node_namespace
                 name = (ns.rstrip("/") + "/" + pubs[0].node_name) if ns not in ("", "/") else pubs[0].node_name
@@ -311,21 +357,29 @@ class GuardProbe:
                 time.sleep(0.2)
         if name is None:
             self.params_source = f"provisional (nothing publishes {INTERFACE['status_topic']})"
+            self.params_unavailable = f"no node publishes {INTERFACE['status_topic']}: no guard to read parameters from"
             return False
         client = AsyncParameterClient(self.node, name)
         if not client.wait_for_services(timeout_sec=max(0.5, deadline - time.monotonic())):
             self.params_source = f"provisional ({name}: no parameter services)"
+            self.params_unavailable = f"the guard ({name}) offers no parameter services"
             return False
-        fut = client.get_parameters(list(PARAMETERS) + list(OPTIONAL_PARAMETERS))
-        if self.wait_for(fut.done, 5.0) is None or fut.result() is None:
-            self.params_source = f"provisional ({name}: get_parameters did not answer)"
-            return False
+        # One request per name, one at a time. rclpy answers a get_parameters that names ANY undeclared parameter with no values at all, so
+        # asking for an optional name the guard does not declare (switch_timeout_s) hid every other value; and eleven requests at once
+        # overflow a service's default request queue (depth 10), so one could go unanswered (both 11 Nov, found by the acceptance gate).
         read = {}
-        for pname, value in zip(list(PARAMETERS) + list(OPTIONAL_PARAMETERS), fut.result().values):
-            v = parameter_value_to_python(value)
-            if v is not None:
-                read[pname] = v
-        self.params.update(read)
+        for pname in list(PARAMETERS) + list(OPTIONAL_PARAMETERS):
+            fut = client.get_parameters([pname])
+            if self.wait_for(fut.done, max(5.0, deadline - time.monotonic())) is None or fut.result() is None:
+                self.params_source = f"provisional ({name}: get_parameters did not answer for {pname})"
+                self.params_unavailable = f"the guard ({name}) did not answer get_parameters for {pname}"
+                return False
+            if fut.result().values:
+                v = parameter_value_to_python(fut.result().values[0])
+                if v is not None:
+                    read[pname] = v
+        self.params_read = dict(read)
+        self.params.update({k: v for k, v in read.items() if value_problem(k, v) is None})   # unusable values stay provisional
         self.state_timeout = float(self.params["state_timeout_s"])
         missing = [p for p in PARAMETERS if p not in read]
         self.params_source = f"guard node {name}" + (f" (not set there, provisional used: {missing})" if missing else "")
@@ -645,12 +699,16 @@ class GuardCase:
         cls.p = GuardProbe(cls.PROFILE, cls.NODE, cls.park)
         cls.joints_ok = cls.p.wait_for_joints(STARTUP_WITHIN_S[cls.PROFILE])
         cls.p.read_guard_parameters(timeout=30.0 if cls.PROFILE == "mock" else 90.0)
+        cls.params_problems = parameter_problems(cls.p.params_read, cls.p.params_unavailable, srdf_states_of_both_arms(srdf_states()))
         cls.params, cls.b = cls.p.params, cls.p.budgets()
         cls.tol = float(cls.params["stowed_tolerance"])
         cls.record = {"profile": cls.PROFILE, "stack_launch": os.environ.get("LIFT_GUARD_STACK_LAUNCH", "bringup moveit.launch.py"),
                       "double_mutant": os.environ.get("LIFT_GUARD_DOUBLE_MUTANT"), "interface": INTERFACE,
                       "parameters": {k: cls.params.get(k) for k in PARAMETERS}, "parameters_source": cls.p.params_source,
-                      "budgets_s": cls.b.as_dict(), "slack": SLACK, "cases": {}}
+                      "budgets_s": cls.b.as_dict(), "slack": SLACK, "cases": {},
+                      "acceptance": {"eligible": not cls.params_problems, "parameter_problems": cls.params_problems,
+                                     "note": None if not cls.params_problems else
+                                     "NOT ACCEPTANCE: provisional values were used; every case and the properties fail (PR #60 review)"}}
 
     @classmethod
     def tearDownClass(cls):
@@ -666,6 +724,7 @@ class GuardCase:
         cls.record["arm_state_receipt_lag_s"] = {"samples": len(lags), "p50": round(lags[len(lags) // 2], 4),
                                                  "p99": round(lags[int(len(lags) * 0.99)], 4),
                                                  "max": round(lags[-1], 4)} if lags else None
+        ok = ok and not cls.params_problems
         write_run_sidecar(cls.CHECK_ID, cls.SLUG, cls.NAME, "PASS" if ok else "FAIL", jsonable(cls.record))
         cls.p.close()
         rclpy.shutdown()
@@ -674,8 +733,20 @@ class GuardCase:
     def case(self, name, **fields):
         self.record["cases"].setdefault(name, {"ok": False}).update(fields)
 
+    def require_guard_parameters(self):
+        """The acceptance gate: a case, the properties or a budget may pass only on the guard's own parameters, read and valid."""
+        self.assertFalse(self.params_problems, "not acceptance: the guard's own parameters were not read and validated, so this ran on "
+                                               f"provisional values: {self.params_problems}")
+
     def passed(self, name):
+        self.require_guard_parameters()
         self.record["cases"][name]["ok"] = True
+
+    def test_a_guard_parameters_are_read_and_valid(self):
+        """Its own case, first, so a report names the reason at the top; passed() and check_properties() enforce it as well."""
+        self.record["cases"].setdefault("a_guard_parameters", {"ok": False}).update(problems=self.params_problems)
+        self.require_guard_parameters()
+        self.record["cases"]["a_guard_parameters"]["ok"] = True
 
     def start(self, name):
         pre = self.p.reset(name, self.b.allow_within)
@@ -728,3 +799,4 @@ class GuardCase:
         self.record["properties"] = {k: {"violations": len(v), "first": v[:5]} for k, v in result.items()}
         broken = {k: v[:3] for k, v in result.items() if v}
         self.assertFalse(broken, f"safety properties broken during the run: {broken}")
+        self.require_guard_parameters()

@@ -47,6 +47,7 @@ if(BUILD_TESTING)
   # --- #44 sim lift guard acceptance (black box: /lift_guard/status, the controller manager, lift_joint, the guard's own parameters) ---
   # The oracle that checks the run-wide safety properties, on synthetic timelines (no ROS graph): it must find every fault it exists for.
   ament_add_pytest_test(lift_guard_oracle test/test_lift_guard_oracle.py TIMEOUT 60)
+  ament_add_pytest_test(lift_guard_parameters test/test_lift_guard_parameters.py TIMEOUT 60)
   # Where the guard is wired: both simulated launches, lift_controller spawned --inactive, nothing in the real profile (source tree only).
   ament_add_pytest_test(lift_guard_static test/test_lift_guard_static.py TIMEOUT 60)
   # L02: arms, controller and the guard's contract on mock. L04: base and odometry on mock. Each in its own ROS_DOMAIN_ID, like L01.
