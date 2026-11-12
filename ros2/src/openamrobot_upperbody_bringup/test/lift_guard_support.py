@@ -271,6 +271,7 @@ class GuardProbe:
         # evidence steps back 0.3-0.7 s several times a run (12 Nov), and the guard fails closed on it (*_STALE).
         self.clock_steps = []
         self._clock_offset = None
+        self.blackouts = []                         # (t0, t1) spans in which a case stopped the joint states itself (joint_states_silenced)
         self.params, self.params_source = dict(PROVISIONAL), "provisional (guard parameters not read yet)"
         self.params_read, self.params_unavailable = None, "the guard's parameters were not read"   # see parameter_problems()
         self.state_timeout = PROVISIONAL["state_timeout_s"]
@@ -416,10 +417,27 @@ class GuardProbe:
         with self.lock:
             self.tl.marks.append((time.monotonic(), label))
 
+    @contextlib.contextmanager
+    def joint_states_silenced(self):
+        """A case that deactivates joint_state_broadcaster (so lift_joint is not sampled either) runs inside this and re-activates it
+        before leaving. The span is declared to the oracle: its P1/P2 do not ask for lift samples inside it, and ask for them everywhere
+        else. Anything else that silences lift_joint is a violation."""
+        start = time.monotonic()
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.blackouts.append((start, time.monotonic()))
+
+    def lift_sample_after(self, t):
+        """True once a lift_joint sample has arrived after monotonic time `t`."""
+        with self.lock:
+            return self.joint_t.get(LIFT, -math.inf) > t
+
     def timeline(self):
         with self.lock:
             tl = Timeline(lift=sorted(self.tl.lift, key=lambda e: e[0]), arms=sorted(self.tl.arms, key=lambda e: e[0]),
-                          status=list(self.tl.status),
+                          status=list(self.tl.status), blackouts=list(self.blackouts),
                           controller=list(self.tl.controller), marks=list(self.tl.marks))
         tl.end = time.monotonic()
         return tl
@@ -542,9 +560,13 @@ class GuardProbe:
         return True
 
     def lift_motion_since(self, t0, t1=None):
+        """Peak-to-peak lift_joint over [t0, t1]. A window of half a second or more with fewer than two samples FAILS: 'the lift did not
+        move' is not said of a lift that was not seen (it used to return 0.0)."""
         t1 = t1 or time.monotonic()
         with self.lock:
             vals = [p for t, p in self.tl.lift if t0 <= t <= t1 and not math.isnan(p)]
+        if len(vals) < 2 and t1 - t0 >= 0.5:
+            raise AssertionError(f"lift_joint was not observed: {len(vals)} sample(s) in {t1 - t0:.1f} s; 'did not move' would be vacuous")
         return (max(vals) - min(vals)) if len(vals) >= 2 else 0.0
 
     def status_rate(self, seconds=3.0):
@@ -808,7 +830,7 @@ class GuardCase:
                       "parameters": {k: cls.params.get(k) for k in PARAMETERS}, "parameters_source": cls.p.params_source,
                       "budgets_s": cls.b.as_dict(), "slack": SLACK, "cases": {},
                       "startup_complete_after_probe_s": cls.startup_complete_s,
-                      "acceptance": {"eligible": not cls.params_problems, "parameter_problems": cls.params_problems,
+                      "acceptance": {"eligible": not cls.params_problems, "parameter_problems": cls.params_problems, "pending": [],
                                      "note": None if not cls.params_problems else
                                      "NOT ACCEPTANCE: provisional values were used; every case and the properties fail (PR #60 review)"}}
 
@@ -830,7 +852,9 @@ class GuardCase:
                                                  "p99": round(lags[int(len(lags) * 0.99)], 4),
                                                  "max": round(lags[-1], 4)} if lags else None
         ok = ok and not cls.params_problems
-        write_run_sidecar(cls.CHECK_ID, cls.SLUG, cls.NAME, "PASS" if ok else "FAIL", jsonable(cls.record))
+        pending = cls.record["acceptance"]["pending"]
+        result = "FAIL" if not ok else "WARN" if pending else "PASS"       # a part that could not be checked yet is not a pass
+        write_run_sidecar(cls.CHECK_ID, cls.SLUG, cls.NAME, result, jsonable(cls.record))
         cls.p.close()
         rclpy.shutdown()
 
@@ -925,6 +949,14 @@ class GuardCase:
                             "controller": near(tl.controller), "wall_clock_steps": near(self.p.clock_steps)})
         if context:
             self.record["violation_context"] = context
+        from lift_guard_oracle import unobserved
+        covered = unobserved(tl, tl.lift[0][0], tl.end, max_gap=0.0) if tl.lift else []
+        self.record["lift_observation"] = {"samples": len(tl.lift), "arm_samples": len(tl.arms), "statuses": len(tl.status),
+                                           "controller_changes": len(tl.controller),
+                                           "longest_gap_s_outside_blackouts": max((g for _, _, g in covered), default=None),
+                                           "declared_blackouts_s": [round(b - a, 2) for a, b in tl.blackouts]}
         broken = {k: v[:3] for k, v in result.items() if v}
         self.assertFalse(broken, f"safety properties broken during the run: {broken}")
+        self.assertTrue(len(tl.lift) >= 2 and len(tl.arms) >= 2 and tl.status and tl.controller,
+                        f"the run recorded too little for the properties to mean anything: {self.record['lift_observation']}")
         self.require_guard_parameters()

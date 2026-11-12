@@ -195,17 +195,18 @@ class TestLiftGuardGazebo(GuardCase, unittest.TestCase):
         name = "03_arm_source_stopped"
         self.start(name)
         z0 = carriage_z()
-        self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
-        try:
-            took = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"), timeout=self.b.stale_reaction)
-            time.sleep(1.0)
-            now = time.monotonic()
-            merged_fresh = all(now - self.merged_t.get(j, 0.0) < 0.5 for j in ARM_JOINTS["left"])
-            accepted, _ = self.try_lift_both_paths(0.03)
-            time.sleep(1.0)
-            dz = self.assert_carriage_still(z0, "arm source stopped")
-        finally:
-            self.p.switch(activate=["joint_state_broadcaster"])
+        with self.p.joint_states_silenced():
+            self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
+            try:
+                took = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"), timeout=self.b.stale_reaction)
+                time.sleep(1.0)
+                now = time.monotonic()
+                merged_fresh = all(now - self.merged_t.get(j, 0.0) < 0.5 for j in ARM_JOINTS["left"])
+                accepted, _ = self.try_lift_both_paths(0.03)
+                time.sleep(1.0)
+                dz = self.assert_carriage_still(z0, "arm source stopped")
+            finally:
+                self.p.switch(activate=["joint_state_broadcaster"])
         self.case(name, blocked_after_s=took, merged_still_fresh=merged_fresh, action_accepted=accepted, carriage_dz_m=dz)
         self.assertFalse(accepted, "lift_controller accepted a goal with the arm source stopped")
         self.assertIsNotNone(took, f"no ARM_STATE_STALE/MISSING within {self.b.stale_reaction:.2f} s although /arm/joint_states stopped "
@@ -218,16 +219,17 @@ class TestLiftGuardGazebo(GuardCase, unittest.TestCase):
         parked = {j: self.park[j] for j in ALL_ARM_JOINTS}
         current = {"pos": dict(parked)}
         rows = {}
-        self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
-        try:
-            with self.p.inject_arm_states(lambda: current["pos"]):
-                rows["fresh_parked_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within + self.b.stale_reaction)
-                current["pos"] = {j: v for j, v in parked.items() if j != "openarm_left_joint7"}
-                rows["one_joint_absent_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"),
-                                                                               timeout=self.b.stale_reaction)
-                current["pos"] = dict(parked)
-        finally:
-            self.p.switch(activate=["joint_state_broadcaster"])
+        with self.p.joint_states_silenced():
+            self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
+            try:
+                with self.p.inject_arm_states(lambda: current["pos"]):
+                    rows["fresh_parked_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within + self.b.stale_reaction)
+                    current["pos"] = {j: v for j, v in parked.items() if j != "openarm_left_joint7"}
+                    rows["one_joint_absent_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"),
+                                                                                   timeout=self.b.stale_reaction)
+                    current["pos"] = dict(parked)
+            finally:
+                self.p.switch(activate=["joint_state_broadcaster"])
         self.case(name, **rows)
         self.assertIsNotNone(rows["fresh_parked_allowed_after_s"], "fresh parked arm state injected on /arm/joint_states was never allowed: "
                              "does the guard read /arm/joint_states in Gazebo?")

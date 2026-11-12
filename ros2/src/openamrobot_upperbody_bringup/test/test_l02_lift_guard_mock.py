@@ -351,15 +351,24 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
     def test_l02_11_arm_joint_state_stopping_blocks(self):
         name = "11_arm_state_stops"
         self.start(name)
-        self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
-        try:
-            took = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"), timeout=self.b.stale_reaction)
-            accepted, _, _ = self.p.lift_goal(START_HEIGHT + 0.03)
-        finally:
-            self.p.switch(activate=["joint_state_broadcaster"])
+        lift_before = self.p.lift()      # where the lift IS, not the nominal START_HEIGHT: a start-up move cut short is not motion in this case
+        with self.p.joint_states_silenced():
+            self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
+            try:
+                took = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"), timeout=self.b.stale_reaction)
+                accepted, _, _ = self.p.lift_goal(START_HEIGHT + 0.03)
+            finally:
+                reactivated = self.p.switch(activate=["joint_state_broadcaster"])
+        t_back = time.monotonic()
+        # the lift is judged by a sample taken AFTER the arm state came back, not by the last one cached before it stopped
+        seen = self.p.wait_for(lambda: self.p.lift_sample_after(t_back), 5.0)
         time.sleep(1.0)
-        moved = abs(self.p.lift() - START_HEIGHT)
-        self.case(name, blocked_after_s=took, action_accepted=accepted, moved_m=round(moved, 5))
+        moved = abs(self.p.lift() - lift_before)
+        self.case(name, blocked_after_s=took, action_accepted=accepted, moved_m=round(moved, 5), lift_before_m=lift_before,
+                  broadcaster_reactivated=reactivated,
+                  lift_seen_again_after_s=seen)
+        self.assertTrue(reactivated, "joint_state_broadcaster did not come back: the lift could not be observed")
+        self.assertIsNotNone(seen, "no lift_joint sample after the arm state came back: 'the lift did not move' would rest on a stale value")
         self.assertLessEqual(moved, lift_still_m(PROFILE), f"the lift moved {moved:.4f} m while there was no arm state")
         self.assertFalse(accepted, "lift_controller accepted a goal with no arm state")
         self.assertIsNotNone(took, f"no ARM_STATE_STALE/MISSING within {self.b.stale_reaction:.2f} s of the arm state stopping")
@@ -372,21 +381,22 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
         parked = {j: self.park[j] for j in ALL_ARM_JOINTS}
         current = {"pos": dict(parked)}
         rows = {}
-        self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
-        try:
-            with self.p.inject_arm_states(lambda: current["pos"]):
-                rows["fresh_parked_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within + self.b.stale_reaction)
-                current["pos"] = {j: v for j, v in parked.items() if j != "openarm_right_joint7"}
-                rows["one_joint_absent_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"),
-                                                                               timeout=self.b.stale_reaction)
-                current["pos"] = dict(parked)
-                rows["restored_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within)
-                current["pos"] = {**parked, "openarm_left_joint3": math.nan}
-                rows["nan_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_NOT_STOWED_LEFT", "ARM_STATE_STALE", "ARM_STATE_MISSING"),
-                                                                  timeout=self.b.pose_reaction)
-                current["pos"] = dict(parked)
-        finally:
-            self.p.switch(activate=["joint_state_broadcaster"])
+        with self.p.joint_states_silenced():
+            self.assertTrue(self.p.switch(deactivate=["joint_state_broadcaster"]), "could not deactivate joint_state_broadcaster")
+            try:
+                with self.p.inject_arm_states(lambda: current["pos"]):
+                    rows["fresh_parked_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within + self.b.stale_reaction)
+                    current["pos"] = {j: v for j, v in parked.items() if j != "openarm_right_joint7"}
+                    rows["one_joint_absent_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_STATE_STALE", "ARM_STATE_MISSING"),
+                                                                                   timeout=self.b.stale_reaction)
+                    current["pos"] = dict(parked)
+                    rows["restored_allowed_after_s"] = self.p.wait_allowed(self.b.allow_within)
+                    current["pos"] = {**parked, "openarm_left_joint3": math.nan}
+                    rows["nan_blocked_after_s"] = self.p.wait_blocked(any_of=("ARM_NOT_STOWED_LEFT", "ARM_STATE_STALE", "ARM_STATE_MISSING"),
+                                                                      timeout=self.b.pose_reaction)
+                    current["pos"] = dict(parked)
+            finally:
+                self.p.switch(activate=["joint_state_broadcaster"])
         self.case(name, **rows)
         self.assertIsNotNone(rows["fresh_parked_allowed_after_s"], "fresh, parked injected arm state was never allowed (does the guard read "
                              f"{'/joint_states'}?)")

@@ -250,6 +250,7 @@ class TestLiftGuardDies(GuardCase, unittest.TestCase):
         if m is None or m["deactivated_after_s"] is None:
             self.skipTest("case 1 measured nothing to compare")
         if budget["s"] is None and budget["m"] is None:
+            self.record["acceptance"]["pending"].append("stopping budget not set (platform-fw #20): measured, not checked")
             self.skipTest(f"stopping budget not set yet (platform-fw #20). Measured with {TAG}: inactive after "
                           f"{m['deactivated_after_s']} s, guard exited after {m['exited_after_s']} s, lift travel "
                           f"{m['travel_after_kill_m'] * 1000:.1f} mm")

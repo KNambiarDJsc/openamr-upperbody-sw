@@ -9,6 +9,9 @@ Properties (each returns a list of violations, empty when it holds):
   P1 no_motion_while_blocked      while the guard reports ERROR (always "blocked", #44 decision of 10 Nov), lift_joint does not move
                                   (after `settle` s from the change)
   P2 no_motion_while_inactive     while lift_controller is not active, lift_joint does not move (after `settle` s)
+                                  P1 and P2 also need to SEE the lift: a stretch of such an interval in which lift_joint was not sampled
+                                  for more than OBSERVE_GAP_S is itself a violation ("unobserved"), not a pass, unless the test declared it
+                                  a blackout (Timeline.blackouts: it stopped the joint states on purpose)
   P3 arm_out_is_blocked           whenever an arm joint is outside the stowed tolerance (or unreadable) for longer than `reaction` s, the
                                   guard reports ERROR with that arm's code (OK or WARN is a breach), and lift_controller is not active. This
                                   is the test's own oracle,
@@ -42,6 +45,7 @@ class Timeline:
     controller: list = field(default_factory=list)    # (t, "active" | "inactive" | ...) for lift_controller
     marks: list = field(default_factory=list)         # (t, label): case boundaries, for the report
     end: float = 0.0
+    blackouts: list = field(default_factory=list)     # (t0, t1): spans in which the test itself stopped the joint states
     status_end: float = None                          # when the status stream ended (the guard's exit, L03); None: at `end`
 
 
@@ -79,9 +83,46 @@ def shrink(intervals, settle):
 
 
 def lift_motion(lift, a, b):
-    """Peak-to-peak lift_joint over samples in [a, b], or 0.0 if fewer than two."""
+    """Peak-to-peak lift_joint over samples in [a, b], or 0.0 if fewer than two. Whether the lift was SEEN is unobserved()'s question:
+    this alone would call an unobserved interval 'no motion'."""
     vals = [p for t, p in lift if a <= t <= b and not math.isnan(p)]
     return (max(vals) - min(vals)) if len(vals) >= 2 else 0.0
+
+
+OBSERVE_GAP_S = 2.0      # the longest stretch inside a P1/P2 interval in which lift_joint may go unsampled (mock: 100 Hz; Gazebo: slower)
+
+
+def unobserved(tl, a, b, max_gap=OBSERVE_GAP_S):
+    """[(from, to, gap_s)]: the stretches of [a, b], outside the declared blackouts, whose longest gap between lift_joint samples (a NaN
+    is not a sample; the stretch's own ends count) is more than `max_gap`. With max_gap=0 every stretch is returned: its coverage."""
+    spans = [(a, b)]
+    for b0, b1 in sorted(tl.blackouts):
+        pieces = []
+        for x, y in spans:
+            if b1 <= x or b0 >= y:
+                pieces.append((x, y))
+            else:
+                pieces += [(x, min(y, b0)), (max(x, b1), y)]
+        spans = [(x, y) for x, y in pieces if y > x]
+    seen = sorted(t for t, p in tl.lift if not math.isnan(p))
+    out = []
+    for x, y in spans:
+        edges = [x] + [t for t in seen if x <= t <= y] + [y]
+        gap = max(q - r for r, q in zip(edges, edges[1:]))
+        if gap > max_gap:
+            out.append((x, y, round(gap, 3)))
+    return out
+
+
+def _lift_violations(tl, prop, intervals, eps):
+    out = []
+    for a, b in intervals:
+        m = lift_motion(tl.lift, a, b)
+        if m > eps:
+            out.append({"property": prop, "from": a, "to": b, "moved_m": m, "case": label_at(tl, a)})
+        out += [{"property": prop, "unobserved": True, "from": x, "to": y, "gap_s": g, "case": label_at(tl, x)}
+                for x, y, g in unobserved(tl, a, b)]
+    return out
 
 
 def _value_at(events, t, index=1, default=None):
@@ -97,14 +138,12 @@ def _value_at(events, t, index=1, default=None):
 def no_motion_while_blocked(tl, settle, eps):
     # ERROR always means blocked (#44 decision of 10 Nov). WARN ("activating") is not blocked; P4 makes sure it carries no code.
     blocked = shrink(step_intervals(tl.status, lambda e: e[1] == ERROR, _status_end(tl)), settle)
-    return [{"property": "P1", "from": a, "to": b, "moved_m": m, "case": label_at(tl, a)}
-            for a, b in blocked for m in [lift_motion(tl.lift, a, b)] if m > eps]
+    return _lift_violations(tl, "P1", blocked, eps)
 
 
 def no_motion_while_inactive(tl, settle, eps):
     inactive = shrink(step_intervals(tl.controller, lambda e: e[1] != "active", tl.end), settle)
-    return [{"property": "P2", "from": a, "to": b, "moved_m": m, "case": label_at(tl, a)}
-            for a, b in inactive for m in [lift_motion(tl.lift, a, b)] if m > eps]
+    return _lift_violations(tl, "P2", inactive, eps)
 
 
 def arm_out_is_blocked(tl, tolerance, reaction, sides=("left", "right")):

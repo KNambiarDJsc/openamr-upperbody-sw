@@ -16,7 +16,7 @@ import unittest
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lift_guard_oracle import Timeline  # noqa: E402
+from lift_guard_oracle import OK, Timeline  # noqa: E402
 from lift_guard_support import PARAMETERS, GuardCase, parameter_problems  # noqa: E402
 
 VALID = {"stowed_states": ["park"], "stowed_tolerance": 0.01, "reference_velocity_max": 0.001, "arm_state_topic": "/joint_states",
@@ -60,8 +60,15 @@ def test_a_stowed_state_that_is_not_in_the_srdf_is_a_problem():
     assert problems == ["stowed_states ['carry']: not SRDF group states of both arms"]
 
 
-def a_case(problems):
-    """A GuardCase as setUpClass would leave it, without ROS: the probe returns an empty (clean) recording, so only the gate can fail."""
+def clean_recording():
+    """A short run in which nothing is wrong: the lift is sampled and still, both arms are in park, the guard says OK, the controller is active."""
+    return Timeline(end=1.0, lift=[(0.0, 0.1), (0.5, 0.1), (1.0, 0.1)],
+                    arms=[(0.0, {"left": 0.0, "right": 0.0}), (0.5, {"left": 0.0, "right": 0.0}), (1.0, {"left": 0.0, "right": 0.0})],
+                    status=[(0.0, OK, "active", ())], controller=[(0.0, "active")])
+
+
+def a_case(problems, recording=clean_recording):
+    """A GuardCase as setUpClass would leave it, without ROS: the probe returns a clean recording, so only the gate can fail."""
     class Case(GuardCase, unittest.TestCase):
         def runTest(self):
             pass
@@ -69,7 +76,7 @@ def a_case(problems):
     c = Case()
     c.params_problems = list(problems)
     c.record = {"cases": {"01_some_case": {"ok": False}}}
-    c.p = types.SimpleNamespace(timeline=lambda: Timeline(end=1.0))
+    c.p = types.SimpleNamespace(timeline=recording)
     c.b = types.SimpleNamespace(settle=0.3, pose_reaction=1.05, status_lag=0.5, warn_max=5.1)
     c.tol = 0.01
     return c
@@ -99,3 +106,11 @@ def test_with_the_guards_own_valid_parameters_the_same_calls_pass():
     c.check_properties()
     c.test_a_guard_parameters_are_read_and_valid()
     assert c.record["cases"]["01_some_case"]["ok"] and c.record["cases"]["a_guard_parameters"]["ok"]
+
+
+def test_a_recording_with_nothing_in_it_is_not_a_pass_even_with_the_guards_own_valid_parameters():
+    """Final review: no samples, no statuses and no controller changes make every property vacuously true."""
+    c = a_case([], recording=lambda: Timeline(end=1.0))
+    with pytest.raises(AssertionError, match="recorded too little"):
+        c.check_properties()
+    assert c.record["lift_observation"]["samples"] == 0

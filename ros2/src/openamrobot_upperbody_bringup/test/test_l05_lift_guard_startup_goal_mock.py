@@ -59,9 +59,12 @@ class TestLiftGuardStartupGoal(GuardCase, unittest.TestCase):
             self.p.wait_for(lambda: abs((self.p.lift() or 0.0) - LIFT_POSITION) < 0.002, reach)
         tl = self.p.timeline()
         before = [p for t, p in tl.lift if t_ok is None or t < t_ok]
-        moved_before = (max(before) - min(before)) if before else 0.0
+        moved_before = (max(before) - min(before)) if len(before) >= 2 else 0.0
         final = self.p.lift()
-        self.case(name, first_ok_found=t_ok is not None, moved_before_first_ok_m=round(moved_before, 5), final_lift=final)
+        self.case(name, first_ok_found=t_ok is not None, moved_before_first_ok_m=round(moved_before, 5), final_lift=final,
+                  lift_samples_before_first_ok=len(before))
+        self.assertGreaterEqual(len(before), 2, "lift_joint was not observed before the guard's first OK: nothing can be said about "
+                                                "the start-up goal moving it")
         self.assertLessEqual(moved_before, lift_still_m(PROFILE), f"the start-up goal moved the lift {moved_before:.4f} m before the guard "
                                                                "ever allowed it")
         self.assertIsNotNone(t_ok, "the guard never allowed the lift after start-up")

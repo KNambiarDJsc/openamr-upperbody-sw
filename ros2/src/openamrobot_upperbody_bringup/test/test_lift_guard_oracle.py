@@ -6,7 +6,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lift_guard_oracle import (ERROR, OK, WARN, Timeline, arm_deviation, evaluate, no_motion_while_blocked,  # noqa: E402
+from lift_guard_oracle import (ERROR, OK, WARN, Timeline, arm_deviation, evaluate, no_motion_while_blocked, unobserved,  # noqa: E402
                                no_motion_while_inactive, step_intervals)
 
 CODES = ("ARM_NOT_STOWED_LEFT", "ARM_NOT_STOWED_RIGHT", "ARM_TRAJECTORY_ACTIVE_LEFT", "ARM_TRAJECTORY_ACTIVE_RIGHT",
@@ -31,6 +31,15 @@ def correct_run():
     return tl
 
 
+def sampled(*points, rate=0.1, end=5.0):
+    """A lift_joint stream at `rate` s between samples, following the step function `points` [(t, position)], to `end`."""
+    out, t = [], 0.0
+    while t <= end + 1e-9:
+        out.append((round(t, 3), [p for tp, p in points if tp <= t][-1]))
+        t += rate
+    return out
+
+
 def total(result):
     return sum(len(v) for v in result.values())
 
@@ -46,13 +55,13 @@ def test_p1_lift_moving_while_the_guard_reports_error_is_found():
 
 
 def test_p1_motion_inside_the_settle_window_is_allowed():
-    tl = Timeline(end=5.0, lift=[(0.0, 0.0), (1.0, 0.0), (1.1, 0.002), (2.0, 0.002), (5.0, 0.002)],
+    tl = Timeline(end=5.0, lift=sampled((0.0, 0.0), (1.1, 0.002)),
                   status=[(0.0, OK, "active", ()), (1.0, ERROR, "inactive", ("BASE_MOVING",))])
     assert no_motion_while_blocked(tl, settle=0.3, eps=0.0005) == []
 
 
 def test_p2_lift_moving_with_the_controller_inactive_is_found():
-    tl = Timeline(end=5.0, lift=[(0.0, 0.0), (2.0, 0.0), (3.0, 0.01), (5.0, 0.01)], controller=[(0.0, "inactive")])
+    tl = Timeline(end=5.0, lift=sampled((0.0, 0.0), (3.0, 0.01)), controller=[(0.0, "inactive")])
     assert no_motion_while_inactive(tl, settle=0.3, eps=0.0005)
 
 
@@ -245,7 +254,50 @@ def test_p6_p1_p7_a_dead_guard_says_nothing():
     warn.status_end = None
     assert evaluate(warn, **ARGS)["P7_switching_on_is_brief"]
     blocked = Timeline(end=10.0, status=[(1.0, ERROR, "inactive", ("BASE_MOVING",))], controller=[(0.0, "active")],
-                       lift=[(3.0, 0.10), (6.0, 0.13)], status_end=2.0)
+                       lift=sampled((0.0, 0.10), (6.0, 0.13), end=10.0), status_end=2.0)
     assert evaluate(blocked, **ARGS)["P1_no_motion_while_blocked"] == []
     blocked.status_end = None
     assert evaluate(blocked, **ARGS)["P1_no_motion_while_blocked"]
+
+
+# ---- P1 / P2 must SEE the lift (final review, 12 Nov) --------------------------------------------------------------------------------------
+BLOCKED = dict(status=[(0.0, ERROR, "inactive", ("BASE_MOVING",))], controller=[(0.0, "inactive")])
+
+
+def test_p1_p2_an_interval_in_which_the_lift_was_never_sampled_is_not_a_pass():
+    """lift_motion() of a stream with no samples is 0.0: 'did not move' must not be said of what was not seen."""
+    result = evaluate(Timeline(end=10.0, lift=[], **BLOCKED), **ARGS)
+    for key in ("P1_no_motion_while_blocked", "P2_no_motion_while_inactive"):
+        assert result[key] and result[key][0].get("unobserved"), (key, result[key])
+
+
+def test_p1_p2_a_long_gap_in_the_lift_samples_is_found_even_when_samples_exist_on_both_sides():
+    lift = [(t / 10, 0.1) for t in range(0, 40)] + [(8.0 + t / 10, 0.1) for t in range(0, 20)]      # 3.9 .. 8.0: silent
+    found = evaluate(Timeline(end=10.0, lift=lift, **BLOCKED), **ARGS)["P1_no_motion_while_blocked"]
+    assert len(found) == 1 and found[0]["unobserved"] and found[0]["gap_s"] > 4.0, found
+
+
+def test_p1_p2_a_stream_without_long_gaps_passes_and_a_nan_is_not_a_sample():
+    assert total(evaluate(Timeline(end=10.0, lift=sampled((0.0, 0.1), end=10.0), **BLOCKED), **ARGS)) == 0
+    nans = [(t, math.nan) for t, _ in sampled((0.0, 0.1), end=10.0)]
+    assert evaluate(Timeline(end=10.0, lift=nans, **BLOCKED), **ARGS)["P1_no_motion_while_blocked"]
+
+
+def test_p1_p2_a_declared_blackout_excuses_exactly_its_span():
+    lift = [(t / 10, 0.1) for t in range(0, 40)] + [(8.0 + t / 10, 0.1) for t in range(0, 20)]
+    declared = Timeline(end=10.0, lift=lift, blackouts=[(3.8, 8.0)], **BLOCKED)
+    assert total(evaluate(declared, **ARGS)) == 0
+    too_short = Timeline(end=10.0, lift=lift, blackouts=[(3.8, 5.0)], **BLOCKED)           # 5.0 .. 8.0 is still unseen
+    found = evaluate(too_short, **ARGS)["P1_no_motion_while_blocked"]
+    assert len(found) == 1 and found[0]["unobserved"] and found[0]["from"] == 5.0 and found[0]["gap_s"] == 3.0, found
+
+
+def test_p1_p2_a_blackout_does_not_excuse_motion_in_the_samples_that_exist():
+    lift = [(t / 10, 0.1) for t in range(0, 40)] + [(8.0 + t / 10, 0.13) for t in range(0, 20)]      # moved during the blackout
+    tl = Timeline(end=10.0, lift=lift, blackouts=[(3.8, 8.0)], **BLOCKED)
+    assert evaluate(tl, **ARGS)["P1_no_motion_while_blocked"][0]["moved_m"] > 0.02
+
+
+def test_unobserved_reports_coverage_for_the_sidecar():
+    tl = Timeline(end=10.0, lift=sampled((0.0, 0.1), end=10.0), blackouts=[(4.0, 6.0)])
+    assert [(x, y) for x, y, _ in unobserved(tl, 0.0, 10.0, max_gap=0.0)] == [(0.0, 4.0), (6.0, 10.0)]
