@@ -345,6 +345,8 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
                                  f"{side}: the lift travelled {r['travel_after_crossing_m']:.4f} m after the arm left the tolerance")
             self.assertLessEqual(r["hold_m"], lift_still_m(PROFILE), f"{side}: no hold after the stop")
             self.assertTrue(r["blocked"], f"{side}: not blocked with ARM_NOT_STOWED_{side.upper()}")
+        for side in rows:       # start() made a record per side; they pass with the case, or the sidecar says FAIL for a green run
+            self.record["cases"][f"{name}_{side}"]["ok"] = True
         self.passed(name)
 
     # ---- 11 arm state stops -----------------------------------------------------------------------------------------------------------

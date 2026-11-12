@@ -94,7 +94,9 @@ OBSERVE_GAP_S = 2.0      # the longest stretch inside a P1/P2 interval in which 
 
 def unobserved(tl, a, b, max_gap=OBSERVE_GAP_S):
     """[(from, to, gap_s)]: the stretches of [a, b], outside the declared blackouts, whose longest gap between lift_joint samples (a NaN
-    is not a sample; the stretch's own ends count) is more than `max_gap`. With max_gap=0 every stretch is returned: its coverage."""
+    is not a sample; the stretch's own ends count) is more than `max_gap`. With max_gap=0 every stretch is returned: its coverage.
+    Before the FIRST lift sample there is nothing to see yet (the guard says ERROR while the stack is still coming up): a stretch starts
+    no earlier than that sample. With no sample at all nothing is clipped, so a lift that was never seen is reported."""
     spans = [(a, b)]
     for b0, b1 in sorted(tl.blackouts):
         pieces = []
@@ -107,6 +109,10 @@ def unobserved(tl, a, b, max_gap=OBSERVE_GAP_S):
     seen = sorted(t for t, p in tl.lift if not math.isnan(p))
     out = []
     for x, y in spans:
+        if seen:
+            x = max(x, seen[0])
+        if y <= x:
+            continue
         edges = [x] + [t for t in seen if x <= t <= y] + [y]
         gap = max(q - r for r, q in zip(edges, edges[1:]))
         if gap > max_gap:

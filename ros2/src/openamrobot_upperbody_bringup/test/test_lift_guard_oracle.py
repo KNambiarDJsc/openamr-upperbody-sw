@@ -301,3 +301,12 @@ def test_p1_p2_a_blackout_does_not_excuse_motion_in_the_samples_that_exist():
 def test_unobserved_reports_coverage_for_the_sidecar():
     tl = Timeline(end=10.0, lift=sampled((0.0, 0.1), end=10.0), blackouts=[(4.0, 6.0)])
     assert [(x, y) for x, y, _ in unobserved(tl, 0.0, 10.0, max_gap=0.0)] == [(0.0, 4.0), (6.0, 10.0)]
+
+
+def test_p1_p2_start_up_before_the_first_lift_sample_is_not_a_gap_but_a_gap_after_it_is():
+    """Final batch, L04: the guard said ERROR from t=0, and lift_joint was first sampled 2.1 s later (the stack was still coming up)."""
+    late = [(2.1 + t / 10, 0.1) for t in range(0, 70)]                 # 2.1 .. 9.0
+    assert total(evaluate(Timeline(end=9.0, lift=late, **BLOCKED), **ARGS)) == 0
+    broken = [(2.1 + t / 10, 0.1) for t in range(0, 20)] + [(7.0 + t / 10, 0.1) for t in range(0, 20)]     # silent 4.0 .. 7.0
+    found = evaluate(Timeline(end=9.0, lift=broken, **BLOCKED), **ARGS)["P1_no_motion_while_blocked"]
+    assert len(found) == 1 and found[0]["unobserved"] and found[0]["gap_s"] > 2.9, found
