@@ -50,7 +50,7 @@ INTERFACE = {
     "odom_stub_executable": os.environ.get("LIFT_GUARD_ODOM_STUB_EXECUTABLE", "lift_guard_odom_stub.py"),
     # The mock zero-odom stub (#44 decision of 10 Nov: std_srvs/SetBool on this service, and a velocity parameter, mock only). The
     # service name is agreed; the node and parameter NAMES below were proposed by these tests and confirmed on #44 (11 Nov).
-    # Without them the odom-loss case skips and base motion is injected on /odom beside the stub.
+    # In mock they are required: L04 fails without them (until 12 Nov it skipped or published /odom itself).
     "odom_stub_enable_service": "/lift_guard_odom_stub/enable",
     "odom_stub_node": "/lift_guard_odom_stub",
     "odom_stub_velocity_parameters": ("linear_x", "angular_z"),   # m/s along x, rad/s about z, published in the twist
@@ -552,6 +552,14 @@ class GuardProbe:
         time.sleep(seconds)
         return (self.status_count - n0) / seconds
 
+    def publisher_nodes(self, topic, settle=3.0):
+        """Fully qualified names of the nodes publishing `topic`, once discovery has named them (a node can be seen before its name)."""
+        def names():
+            infos = self.node.get_publishers_info_by_topic(topic)
+            return [f"{i.node_namespace.rstrip('/')}/{i.node_name}" for i in infos], infos
+        self.wait_for(lambda: all("_UNKNOWN_" not in n for n in names()[0]) and names()[1], settle)
+        return sorted(n for n in names()[0] if n != f"/{self.node.get_name()}")
+
     def status_publisher_qos(self):
         return [(i.node_name, i.qos_profile.durability, i.qos_profile.reliability)
                 for i in self.node.get_publishers_info_by_topic(INTERFACE["status_topic"])]
@@ -691,18 +699,16 @@ class GuardProbe:
 
     @contextlib.contextmanager
     def base_motion(self, linear=0.0, angular=0.0):
-        """The base 'moving' with this twist while the block runs. Through the mock stub's velocity parameters when it has them (#44,
-        10 Nov), so the guard sees one source of /odom; otherwise published on /odom beside the stub (which the guard's 'stopped
-        continuously for the hold time' rule must also handle). -> {"method": "stub" | "injected"}"""
-        if self.odom_stub_velocity(linear, angular):
-            try:
-                yield {"method": "stub"}
-            finally:
-                self.odom_stub_velocity(0.0, 0.0)
-        else:
-            with self.inject_odom(linear=linear, angular=angular) as sent:
-                sent["method"] = "injected"
-                yield sent
+        """The base 'moving' with this twist while the block runs, through the mock stub's velocity parameters (decided on #44, 10 Nov;
+        names confirmed 11 Nov), so the guard sees one source of /odom. The stub is required: without it this FAILS the case. Until 12 Nov
+        it fell back to publishing /odom itself, so the base cases could pass with no stub in the launch (PR #60 review). -> {"method"}"""
+        if not self.odom_stub_velocity(linear, angular):
+            raise AssertionError(f"the mock odometry stub {INTERFACE['odom_stub_node']} does not take "
+                                 f"{INTERFACE['odom_stub_velocity_parameters']}: mock must start it (#44, 10 Nov)")
+        try:
+            yield {"method": "stub"}
+        finally:
+            self.odom_stub_velocity(0.0, 0.0)
 
     def odom_stub(self, enable, timeout=3.0):
         """The PROPOSED stub switch (INTERFACE['odom_stub_enable_service']). -> True/False, or None if the service does not exist."""

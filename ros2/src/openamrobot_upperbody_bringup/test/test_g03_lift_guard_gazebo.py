@@ -26,6 +26,7 @@ Cases (each from: both arms parked, lift at 0.10 m, except 00)
   06 MEASUREMENT for the Gazebo stowed_tolerance (#44, 10 Nov: "set per profile from Karthik's settled-error measurement plus margin"):
      per-joint |position - park| on /arm/joint_states at rest, during a lift move, while the base drives, and after each arm leaves park
      and is sent back. Fails only if there is no data, or if the arms at rest in park sit outside the guard's own tolerance
+  07 the wiring at runtime: one guard process, no odometry stub process, /odom from the simulated base
   zz the safety properties P1-P7 over the whole run
 
 Simulation only; nothing here is evidence about the firmware interlock (CTL-017).
@@ -55,7 +56,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "openamrobot_upperbody_gazebo", "test"))
 from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # noqa: E402
 from lift_guard_support import (ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, LIFT_CONTROLLER, GuardCase, lift_still_m,  # noqa: E402
-                                stack_under_test)
+                                pids_running, stack_under_test)
 from sim_test_support import gz_link_poses  # noqa: E402
 
 PROFILE = "gazebo"
@@ -333,6 +334,23 @@ class TestLiftGuardGazebo(GuardCase, unittest.TestCase):
             self.assertLessEqual(summary[cond]["max_rad"], self.tol,
                                  f"{cond}: {summary[cond]['joint']} sits {summary[cond]['max_rad']} rad from park, outside the "
                                  "guard's tolerance")
+        self.passed(name)
+
+    def test_g03_07_one_guard_runs_and_odometry_comes_from_the_simulator_not_a_stub(self):
+        """The Gazebo half of the wiring, at runtime (PR #60 review, 12 Nov): exactly one guard process, no stub process, /odom published
+        and by no stub node."""
+        name = "07_runtime_wiring"
+        self.case(name)
+        domain = os.environ["ROS_DOMAIN_ID"]
+        guards, stubs = pids_running(INTERFACE["guard_executable"], domain), pids_running(INTERFACE["odom_stub_executable"], domain)
+        odom = self.p.publisher_nodes("/odom")
+        status = self.p.publisher_nodes(INTERFACE["status_topic"])
+        self.case(name, guard_pids=guards, stub_pids=stubs, odom_publishers=odom, status_publishers=status)
+        self.assertEqual(len(guards), 1, f"processes running {INTERFACE['guard_executable']}: {guards}")
+        self.assertEqual(stubs, [], f"Gazebo runs the mock odometry stub: {stubs}")
+        self.assertTrue(odom, "nothing publishes /odom in Gazebo")
+        self.assertFalse([n for n in odom if "odom_stub" in n], f"/odom publishers: {odom} (Gazebo: the simulated base only)")
+        self.assertEqual(len(status), 1, f"{INTERFACE['status_topic']} publishers: {status}")
         self.passed(name)
 
     def test_g03_zz_safety_properties_held_throughout_the_run(self):

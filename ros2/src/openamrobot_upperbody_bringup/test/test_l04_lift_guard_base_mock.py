@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 """L04 (#44): the lift guard on `mock`: the base condition (odometry).
 
-mock has no base; the design starts a zero-odom stub with the guard. Decided on #44 (10 Nov): the stub takes std_srvs/SetBool on
-/lift_guard_odom_stub/enable and a velocity parameter, mock only. Base motion goes through that parameter when the stub has it (one source
-of /odom, as the guard sees on a real base); otherwise the test publishes /odom beside the stub, where the guard's rule "stopped
-CONTINUOUSLY for base_stopped_hold_s" must still block on one moving sample among the stub's zeros. Each case records which method it
-used. A NaN twist is always injected: it models a corrupted message, not a base. The thresholds are read from the guard
+mock has no base; the design starts a zero-odom stub with the guard. Decided on #44 (10 Nov), names confirmed 11 Nov: the stub takes
+std_srvs/SetBool on /lift_guard_odom_stub/enable and velocity parameters linear_x / angular_z, mock only. Base motion goes through those
+parameters (one source of /odom, as the guard sees on a real base), and a missing stub, parameter or switch FAILS the case: until 12 Nov
+the test published /odom itself or skipped, so these cases could pass with no stub at all (PR #60 review). A NaN twist is injected: it
+models a corrupted message, not a base. The thresholds are read from the guard
 (base_linear_speed_max, base_angular_speed_max, base_stopped_hold_s); the hold time is measured from the last moving sample seen on /odom.
 
 Cases (each from: both arms parked, lift at 0.10 m)
@@ -14,7 +14,7 @@ Cases (each from: both arms parked, lift at 0.10 m)
   03 a NaN twist blocks (a non-finite reading never counts as stopped)
   04 hold time: after the last moving sample the guard allows no sooner than base_stopped_hold_s, and not much later
   05 arm out and base moving together: both codes; the base stopping leaves the arm's code alone
-  06 odometry going missing (the stub stopped): ODOM_STALE or ODOM_MISSING. Needs the stub switch proposed on #44; skipped without it
+  06 odometry going missing (the stub switched off): ODOM_STALE or ODOM_MISSING; the stub's switch is required
   zz the safety properties P1-P6 over the whole run
 
 On main before the guard exists this FAILs by design. Simulation only.
@@ -158,9 +158,10 @@ class TestLiftGuardBaseMock(GuardCase, unittest.TestCase):
     def test_l04_06_odometry_going_missing_blocks(self):
         name = "06_odom_missing"
         self.start(name)
-        if self.p.odom_stub(False) is None:
-            self.case(name, ok=True, skipped=f"no {INTERFACE['odom_stub_enable_service']} (proposed on #44)")
-            self.skipTest(f"the mock odom stub has no switch ({INTERFACE['odom_stub_enable_service']}, proposed on #44)")
+        switched = self.p.odom_stub(False)
+        self.case(name, stub_switch=switched)
+        # Required since the names were confirmed on #44 (11 Nov); it used to skip here, which hid a missing stub (PR #60 review)
+        self.assertIsNotNone(switched, f"the mock odometry stub has no switch {INTERFACE['odom_stub_enable_service']} (#44, 10 Nov)")
         try:
             took = self.p.wait_blocked(any_of=("ODOM_STALE", "ODOM_MISSING"), timeout=self.b.stale_reaction)
             accepted, t0 = self.try_lift_both_paths(0.03)

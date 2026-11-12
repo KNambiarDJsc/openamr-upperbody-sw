@@ -27,6 +27,7 @@ Cases
   13 MoveIt: a lift request through move_group with an arm out does not move the lift
   14 two reasons at once: both arms out gives both codes; parking one leaves the other
   15 every stowed state the guard declares (stowed_states; park today, carry once Q7 adds it to the SRDF) allows the lift
+  16 the wiring at runtime: one guard process, one odometry stub process, the stub the only /odom publisher, and publishing
   zz the safety properties P1-P7 held over the whole run
 
 On main before the guard exists this FAILs by design (the red half of the #44 integration branch). Simulation only: it says nothing about
@@ -53,7 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # noqa: E402
 from lift_guard_oracle import first_crossing  # noqa: E402
 from lift_guard_support import (ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, LIFT, LIFT_CONTROLLER, START_HEIGHT, GuardCase,  # noqa: E402
-                                joint_limits, lift_still_m, srdf_states, stack_under_test)
+                                joint_limits, lift_still_m, pids_running, srdf_states, stack_under_test)
 
 PROFILE = "mock"
 EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["guard_executable"]]
@@ -462,6 +463,27 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
         for state, r in tried.items():
             self.assertIsNotNone(r["allowed_after_s"], f"both arms at stowed state {state!r}: the guard did not allow the lift")
             self.assertGreater(r["moved_m"], 0.008, f"both arms at stowed state {state!r}: the lift did not move")
+        self.passed(name)
+
+    # ---- 16 the wiring, at runtime -----------------------------------------------------------------------------------------------------
+    def test_l02_16_one_guard_and_one_odometry_stub_run_and_the_stub_is_the_only_odom_source(self):
+        """What test_lift_guard_static.py reads off the launch description, on the running stack (PR #60 review, 12 Nov): in this test's
+        ROS domain exactly one process runs the guard and exactly one the stub, the stub is the only publisher of /odom, and it publishes."""
+        name = "16_runtime_wiring"
+        self.case(name)
+        domain = os.environ["ROS_DOMAIN_ID"]
+        guards, stubs = pids_running(INTERFACE["guard_executable"], domain), pids_running(INTERFACE["odom_stub_executable"], domain)
+        odom = self.p.publisher_nodes("/odom")
+        status = self.p.publisher_nodes(INTERFACE["status_topic"])
+        t0 = time.monotonic()
+        time.sleep(1.0)
+        published = len([t for t in self.p.odom_times(published=True) if t >= t0])
+        self.case(name, guard_pids=guards, stub_pids=stubs, odom_publishers=odom, status_publishers=status, odom_samples_in_1s=published)
+        self.assertEqual(len(guards), 1, f"processes running {INTERFACE['guard_executable']}: {guards}")
+        self.assertEqual(len(stubs), 1, f"processes running {INTERFACE['odom_stub_executable']}: {stubs}")
+        self.assertEqual(odom, [INTERFACE["odom_stub_node"]], f"/odom publishers: {odom} (mock: the stub only)")
+        self.assertEqual(len(status), 1, f"{INTERFACE['status_topic']} publishers: {status}")
+        self.assertGreaterEqual(published, 5, f"the stub published {published} /odom samples in 1 s")
         self.passed(name)
 
     def test_l02_zz_safety_properties_held_throughout_the_run(self):
