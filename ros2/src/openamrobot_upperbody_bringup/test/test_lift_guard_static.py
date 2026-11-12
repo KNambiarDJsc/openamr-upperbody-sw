@@ -163,6 +163,16 @@ def command(process):
     return [text(part) for part in process.cmd]
 
 
+def deactivates_lift_controller(c):
+    """Whether command `c` is `ros2 control switch_controllers ... --deactivate lift_controller` with no activation in it. Wrapped is fine
+    (#53 bounds the fallback: `timeout --kill-after=2 15 ros2 control ...`); what must be there is the call and the deactivation."""
+    for i in range(len(c) - 2):
+        if c[i:i + 3] == ["ros2", "control", "switch_controllers"]:
+            rest = c[i + 3:]
+            return "--activate" not in rest and "--deactivate" in rest and rest[rest.index("--deactivate") + 1:][:1] == [LIFT_CONTROLLER]
+    return False
+
+
 def guards(launch):
     return [n for n in launch.nodes if n.node_package == CONTROL and n.node_executable == GUARD]
 
@@ -196,9 +206,7 @@ def test_the_guards_own_exit_deactivates_lift_controller(sim, profile):
     assert len(handlers) == 1, f"{profile}: expected one OnProcessExit on the guard Node itself, found {len(handlers)}"
     started = on_exit(sim[profile], found[0], -9)
     commands = [command(p) for p in started.processes]
-    deactivating = [c for c in commands if c[:3] == ["ros2", "control", "switch_controllers"] and "--deactivate" in c
-                    and c[c.index("--deactivate") + 1] == LIFT_CONTROLLER]
-    assert deactivating, f"{profile}: the guard's exit starts no deactivation of {LIFT_CONTROLLER}: {commands}"
+    assert [c for c in commands if deactivates_lift_controller(c)],         f"{profile}: the guard's exit starts no deactivation of {LIFT_CONTROLLER}: {commands}"
 
 
 @pytest.mark.parametrize("profile", sorted(SIM_LAUNCHES))
@@ -333,3 +341,17 @@ def test_the_syntax_check_ignores_docstrings_and_names_but_sees_imports_and_exec
     wired = tmp_path / "wired.launch.py"
     wired.write_text(f'from {CONTROL}.lift_guard_launch import lift_guard_actions as nodes\nNode(executable="{STUB}")\n')
     assert len(wiring_in_source(str(wired))) == 2
+
+
+@pytest.mark.parametrize("c, expected", [
+    (["ros2", "control", "switch_controllers", "--deactivate", "lift_controller", "--best-effort"], True),
+    (["timeout", "--kill-after=2", "15", "ros2", "control", "switch_controllers", "--deactivate", "lift_controller", "--best-effort"], True),
+    (["ros2", "control", "switch_controllers", "--activate", "lift_controller"], False),
+    (["ros2", "control", "switch_controllers", "--deactivate", "lift_controller", "--activate", "lift_controller"], False),
+    (["ros2", "control", "switch_controllers", "--deactivate", "left_arm_controller"], False),
+    (["ros2", "control", "switch_controllers", "--deactivate"], False),
+    (["echo", "--deactivate", "lift_controller"], False),
+    (["ros2", "control", "list_controllers", "--deactivate", "lift_controller"], False),
+])
+def test_the_exit_command_check_accepts_a_wrapped_deactivation_and_nothing_else(c, expected):
+    assert deactivates_lift_controller(c) is expected
