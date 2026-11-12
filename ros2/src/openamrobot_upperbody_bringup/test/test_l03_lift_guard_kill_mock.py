@@ -13,6 +13,10 @@ Measured and checked, in this order:
   3  the hold: lift_joint stays put afterwards
   4  further commands are rejected: the action goal is not accepted and a topic trajectory does not move the lift
   5  re-activating lift_controller by hand does not replay the interrupted goal
+  6  nothing re-activates lift_controller between its deactivation and the test's own re-activation in 5: not the dying guard (a
+     drive path still running during its exit, PR #53 review, 11 Nov) and nothing else
+  7  the kill hit the guard ALONE: the mock odometry stub's process stayed alive from the signal to the end of the case, and /odom kept
+     arriving, with no gap longer than the guard's own state_timeout_s (PR #60 review, 12 Nov: a substring selector killed both)
   +  the run-wide safety properties (P1-P7) over everything recorded
   2  the stopping budget: time to inactive and lift travel after the signal, against OPENAMR_LIFT_GUARD_STOP_BUDGET_S / _M. The budget is
      NOT set yet: it comes from the lift speed in platform-fw #20, and the 19-30 mm measured on #53 is not acceptable as the final number
@@ -22,12 +26,13 @@ Measured and checked, in this order:
 The design does not claim protection against a HUNG guard (alive but not deciding); that is not tested here.
 
 Its own launch test because it kills a process of the launch on purpose; here the guard alone may die, and only of the signal sent.
+The guard is the process that runs INTERFACE["guard_executable"] exactly (lift_guard.py on #53) in this test's ROS domain; see
+lift_guard_support.program_names().
 On main (no guard) it FAILs at its precondition: there is nothing to kill. Simulation only.
 """
 import os
 import random
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -52,7 +57,8 @@ from ament_index_python.packages import get_package_prefix  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a7_support import A7_ENABLED, SKIP_REASON  # noqa: E402
-from lift_guard_support import INTERFACE, LIFT_CONTROLLER, GuardCase, lift_still_m, stack_under_test  # noqa: E402
+from lift_guard_support import (INTERFACE, LIFT_CONTROLLER, SLACK, GuardCase, launch_process_is, lift_still_m, longest_gap,  # noqa: E402
+                                pids_running, stack_under_test)
 
 sys.path.insert(0, os.path.join(get_package_prefix("openamrobot_upperbody_description"), "lib", "openamrobot_upperbody_description"))
 from launch_guard import EXIT_OK, MOVE_GROUP_ALLOWED, assert_launch_healthy, assert_no_process_died  # noqa: E402
@@ -66,7 +72,8 @@ STOP_WINDOW_S, STOP_EPS_M = 0.5, 0.0002
 HOLD_S = 3.0
 SELF_DEACTIVATE_GRACE_S = 0.3     # TERM: inactive no later than the exit plus event delivery
 GUARD_EXIT_CODES = [-KILL_SIGNAL, 0, 1] if KILL_SIGNAL == signal.SIGTERM else [-KILL_SIGNAL]
-EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["process_pattern"]]
+GUARD, STUB = INTERFACE["guard_executable"], INTERFACE["odom_stub_executable"]
+EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", GUARD, STUB]
 
 
 @pytest.mark.launch_test
@@ -78,25 +85,13 @@ def generate_test_description():
 
 
 def guard_pids():
-    """PIDs of the guard in THIS test's ROS domain. The pattern must be in argv[0] or argv[1] (the program, or the script a python3 runs),
-    so a process whose ARGUMENTS merely mention it (the test runner itself, a shell) is never matched; and its environment must carry this
-    test's ROS_DOMAIN_ID, so a guard of another stack on the machine is never killed."""
-    mine = []
-    for pid in subprocess.run(["pgrep", "-f", INTERFACE["process_pattern"]], capture_output=True, text=True).stdout.split():
-        pid = int(pid)
-        if pid == os.getpid():
-            continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
-            with open(f"/proc/{pid}/environ", "rb") as f:
-                env = dict(kv.split(b"=", 1) for kv in f.read().split(b"\0") if b"=" in kv)
-        except OSError:
-            continue
-        head = [os.path.basename(a) for a in argv[:2]]
-        if any(INTERFACE["process_pattern"] in a for a in head) and env.get(b"ROS_DOMAIN_ID") == os.environ["ROS_DOMAIN_ID"].encode():
-            mine.append(pid)
-    return mine
+    """PIDs of the guard in THIS test's ROS domain: the processes that run GUARD exactly. Not the odometry stub (lift_guard_odom_stub.py),
+    not a launcher or shell that only mentions it, not a guard of another stack on the machine."""
+    return pids_running(GUARD, os.environ["ROS_DOMAIN_ID"])
+
+
+def odom_stub_pids():
+    return pids_running(STUB, os.environ["ROS_DOMAIN_ID"])
 
 
 def _alive(pid):
@@ -145,9 +140,11 @@ class TestLiftGuardDies(GuardCase, unittest.TestCase):
         name = f"1_{TAG}"
         pre = self.start(name)
         self.assertTrue(pre["allowed"], f"the guard never allowed the lift (status {self.p.current_status()}): nothing to test")
-        pids = guard_pids()
-        self.case(name, signal=TAG, guard_pids=pids)
-        self.assertTrue(pids, f"no process with {INTERFACE['process_pattern']!r} in argv[0:2] in this ROS domain: nothing to kill")
+        pids, stubs = guard_pids(), odom_stub_pids()
+        self.case(name, signal=TAG, guard_executable=GUARD, guard_pids=pids, odom_stub_executable=STUB, odom_stub_pids=stubs)
+        self.assertTrue(pids, f"no process runs {GUARD} in this ROS domain: nothing to kill")
+        self.assertTrue(stubs, f"no process runs {STUB} in this ROS domain: mock needs its odometry stub, and this case must show that "
+                               "it survives the kill")
 
         l0 = self.p.lift()
         handle, seconds = None, 0.0
@@ -160,11 +157,15 @@ class TestLiftGuardDies(GuardCase, unittest.TestCase):
         self.assertEqual(self.p.lift_controller_state(), "active", "lift_controller was not active before the kill (precondition)")
         t_kill = time.monotonic()
         exits = watch_exits(pids, t_kill, self.b.kill_deactivate + 10.0)
+        stub_exits = watch_exits(stubs, t_kill, 600.0)      # for the whole case: the stub must outlive all of it
         for pid in pids:
             os.kill(pid, KILL_SIGNAL)
         inactive = self.p.wait_for(lambda: self.p.lift_controller_state() != "active", self.b.kill_deactivate)
         self.p.wait_for(lambda: len(exits) == len(pids), 5.0)
         exited = max(exits.values()) if len(exits) == len(pids) else None
+        if exited is not None:                  # the oracle judges the guard's statuses up to its exit (GuardCase.status_valid_until)
+            type(self).status_valid_until = t_kill + exited
+        self.assert_the_guard_alone_was_hit(name, stubs, stub_exits, t_kill)
         still = self.wait_still(max(0.5, self.b.kill_deactivate + 2.0 - (time.monotonic() - t_kill)))
         goal_status = self.p.result(handle, 5.0)[0] if handle is not None else None
         stopped = self.p.lift()
@@ -196,13 +197,48 @@ class TestLiftGuardDies(GuardCase, unittest.TestCase):
         self.assertFalse(accepted, "a lift goal was accepted with the guard dead")
         self.assertLessEqual(after, lift_still_m(PROFILE), f"a command moved the lift {after:.4f} m with the guard dead")
 
+        # 6: from its first deactivation after the signal until the test re-activates it here, lift_controller must stay off
+        t_manual = time.monotonic()
+        changes = [(round(t - t_kill, 3), st) for t, st in self.p.controller_changes(t_kill, t_manual)]
+        first_off = next((i for i, (_, st) in enumerate(changes) if st != "active"), None)
+        back_on = [c for c in changes[first_off + 1:] if c[1] == "active"] if first_off is not None else []
+        self.case(name, controller_changes_after_kill=changes, reactivated_without_the_test=back_on)
+        self.assertFalse(back_on, f"{LIFT_CONTROLLER} went active again after it was deactivated following {TAG}, before the test "
+                                  f"re-activated it (s after the signal, state): {back_on}. Nothing may switch it back on while the guard "
+                                  "is dying or dead (PR #53 review, 11 Nov)")
+
         reactivated = self.p.switch(activate=[LIFT_CONTROLLER])
         t_re = time.monotonic()
         time.sleep(3.0)
         replay = self.p.lift_motion_since(t_re)
         self.case(name, manual_reactivation_ok=reactivated, moved_after_reactivation_m=round(replay, 5))
         self.assertLessEqual(replay, lift_still_m(PROFILE), f"re-activation replayed a goal: the lift moved {replay:.4f} m")
+
+        # 7: throughout, not only at the kill
+        self.assert_the_guard_alone_was_hit(name, stubs, stub_exits, t_kill)
         self.passed(name)
+
+    def assert_the_guard_alone_was_hit(self, name, stubs, stub_exits, t_kill):
+        """The odometry stub's processes are alive and none has exited since the signal, and it has kept publishing /odom: no gap since the
+        signal, by the samples' own stamps, longer than the guard's own state_timeout_s (times SLACK, the point at which the guard itself
+        would call odometry stale) plus the backward wall-clock steps measured meanwhile (in mock the stub's timer runs on the wall clock,
+        so a step holds it up by its size: 0.76 s and 1.07 s gaps on the WSL2 evidence host, 12 Nov). The gap by arrival here is recorded
+        beside it (a busy test process is not a silent source). A dead stub leaves a gap that runs to the end of the case."""
+        now = time.monotonic()
+        dead = sorted(set(stub_exits) | {pid for pid in stubs if not _alive(pid)})
+        gap = longest_gap(self.p.odom_times(published=True), t_kill, now)
+        gap_arrival = longest_gap(self.p.odom_times(), t_kill, now)
+        stepped = self.p.clock_stepped_back(t_kill - 1.0, now)
+        gap_max = float(self.params["state_timeout_s"]) * SLACK + stepped
+        self.case(name, odom_stub_exited=dead, odom_longest_gap_since_kill_s=round(gap, 3),
+                  odom_longest_arrival_gap_since_kill_s=round(gap_arrival, 3), odom_gap_max_s=round(gap_max, 3),
+                  wall_clock_stepped_back_s=round(stepped, 3), odom_checked_until_s=round(now - t_kill, 2))
+        died_at = {pid: round(stub_exits[pid], 3) for pid in dead if pid in stub_exits}
+        self.assertFalse(dead, f"the odometry stub ({STUB}, pids {dead}) died after the guard got {TAG} (s after the signal: {died_at}): "
+                               "the kill must hit the guard alone")
+        self.assertLessEqual(gap, gap_max, f"/odom stopped for {gap:.2f} s after the guard got {TAG} (allowed {gap_max:.2f} s: the guard's "
+                                           f"state_timeout_s x SLACK, plus {stepped:.2f} s the wall clock stepped back): the odometry "
+                                           "source did not survive the kill")
 
     def test_l03_2_stopping_within_the_budget(self):
         """Skips, with the measurement in the reason, until the budget from platform-fw #20 is set in the environment."""
@@ -236,7 +272,7 @@ class TestProcessesAlive(unittest.TestCase):
         except AssertionError:
             died = {name: getattr(proc_info[name], "returncode", None) for name in proc_info.process_names()}
             died = {n: c for n, c in died.items() if c not in (None, EXIT_OK)}
-            others = {n: c for n, c in died.items() if not (n.startswith(INTERFACE["process_pattern"]) and c in GUARD_EXIT_CODES)}
+            others = {n: c for n, c in died.items() if not (launch_process_is(n, GUARD) and c in GUARD_EXIT_CODES)}
             self.assertFalse(others, f"processes other than the killed guard died during the test: {others}")
 
 
@@ -245,4 +281,4 @@ class TestProcessesAlive(unittest.TestCase):
 class TestShutdown(unittest.TestCase):
     def test_l03_processes_started_and_exited_cleanly(self, proc_info):
         assert_launch_healthy(proc_info, expected=EXPECTED_PROCESSES,
-                              allowed={INTERFACE["process_pattern"]: GUARD_EXIT_CODES, **MOVE_GROUP_ALLOWED})
+                              allowed={GUARD: GUARD_EXIT_CODES, **MOVE_GROUP_ALLOWED})

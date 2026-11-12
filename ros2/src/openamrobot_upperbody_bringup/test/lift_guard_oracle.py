@@ -19,7 +19,8 @@ Properties (each returns a list of violations, empty when it holds):
                                   published set only; lift_controller one of active, inactive, activating
   P5 status_matches_controller    the status's lift_controller value agrees with the controller manager within `lag` s ("activating"
                                   counts as not active yet)
-  P6 allowed_means_active         OK with lift_controller inactive, or ERROR with it active, does not persist beyond `lag` s
+  P6 allowed_means_active         OK with lift_controller not active, or ERROR with it active, does not persist beyond `lag` s (the
+                                  status read as a step function: a status in flight across a switch is not a breach)
   P7 switching_on_is_brief        WARN ("activating") is transitional: each WARN spell ends within `warn_max` s (OK, or ERROR with
                                   SWITCH_FAILED). Spells before lift_controller is first seen at all (still being loaded) are not counted
 
@@ -41,6 +42,12 @@ class Timeline:
     controller: list = field(default_factory=list)    # (t, "active" | "inactive" | ...) for lift_controller
     marks: list = field(default_factory=list)         # (t, label): case boundaries, for the report
     end: float = 0.0
+    status_end: float = None                          # when the status stream ended (the guard's exit, L03); None: at `end`
+
+
+def _status_end(tl):
+    """A status holds until the next one, the last until the guard's status stream ended: a dead guard says nothing."""
+    return tl.end if tl.status_end is None else min(tl.status_end, tl.end)
 
 
 def label_at(timeline, t):
@@ -89,7 +96,7 @@ def _value_at(events, t, index=1, default=None):
 
 def no_motion_while_blocked(tl, settle, eps):
     # ERROR always means blocked (#44 decision of 10 Nov). WARN ("activating") is not blocked; P4 makes sure it carries no code.
-    blocked = shrink(step_intervals(tl.status, lambda e: e[1] == ERROR, tl.end), settle)
+    blocked = shrink(step_intervals(tl.status, lambda e: e[1] == ERROR, _status_end(tl)), settle)
     return [{"property": "P1", "from": a, "to": b, "moved_m": m, "case": label_at(tl, a)}
             for a, b in blocked for m in [lift_motion(tl.lift, a, b)] if m > eps]
 
@@ -176,21 +183,29 @@ def status_matches_controller(tl, lag):
 
 
 def allowed_means_active(tl, lag):
-    """P6: OK must come with lift_controller active, ERROR with it inactive, apart from transitions shorter than `lag`. WARN (switching on)
+    """P6: OK with lift_controller not active, or ERROR with it active, does not persist beyond `lag` s. The status is read as a step
+    function, like the controller's state: each status holds until the next one, the last until the status stream ends. So a status that
+    was already in flight when the controller switched is not a breach (12 Nov, first run on the integrated stack: an OK published while
+    the controller was active arrived 0-7 ms after the deactivation event and 7 ms before the guard's ERROR; the per-status check used until
+    then looked only forward and flagged it), and a guard that keeps saying OK after its controller went inactive is. WARN (switching on)
     asks nothing of the controller here: an activation the guard has not seen yet is not a breach, and P7 bounds how long WARN lasts."""
-    def reached(t, want_active):
-        """lift_controller was in the wanted state at t, or got there at some moment in (t, t + lag]."""
-        def ok(state):
-            return (state == "active") == want_active
-        return ok(_value_at(tl.controller, t)) or any(t < tc <= t + lag and ok(s) for tc, s in tl.controller)
-
+    end = _status_end(tl)
+    status = sorted(tl.status, key=lambda e: e[0])
+    controller = sorted(tl.controller, key=lambda e: e[0])
+    points = sorted({e[0] for e in status if e[0] <= end} | {e[0] for e in controller if e[0] <= end})
     out = []
-    for t, level, ctl, codes in tl.status:
-        if level == OK and not reached(t, True):
-            out.append({"property": "P6", "at": t, "status": "OK", "controller": _value_at(tl.controller, t + lag), "case": label_at(tl, t)})
-        if level == ERROR and not reached(t, False):
-            out.append({"property": "P6", "at": t, "status": "ERROR", "controller": _value_at(tl.controller, t + lag), "case": label_at(tl, t)})
-    return out
+    for level, name, wants_active in ((OK, "OK", True), (ERROR, "ERROR", False)):
+        since = None
+        for t in points + [end]:
+            on = t < end and _value_at(status, t, index=1) == level and (_value_at(controller, t) == "active") != wants_active
+            if on and since is None:
+                since = t
+            elif not on and since is not None:
+                if t - since > lag:
+                    out.append({"property": "P6", "at": since, "for_s": round(t - since, 3), "status": name,
+                                "controller": _value_at(controller, since), "case": label_at(tl, since)})
+                since = None
+    return sorted(out, key=lambda v: v["at"])
 
 
 def switching_on_is_brief(tl, warn_max):
@@ -200,7 +215,7 @@ def switching_on_is_brief(tl, warn_max):
     out = []
     if first_seen is None:
         return out
-    for a, b in step_intervals(tl.status, lambda e: e[1] == WARN, tl.end):
+    for a, b in step_intervals(tl.status, lambda e: e[1] == WARN, _status_end(tl)):
         a = max(a, first_seen)
         if b - a > warn_max:
             out.append({"property": "P7", "from": a, "to": b, "for_s": round(b - a, 3), "case": label_at(tl, a)})

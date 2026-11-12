@@ -39,7 +39,7 @@ from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # no
 from lift_guard_support import INTERFACE, GuardCase, lift_still_m, stack_under_test  # noqa: E402
 
 PROFILE = "mock"
-EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["process_pattern"]]
+EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["guard_executable"]]
 
 
 @pytest.mark.launch_test

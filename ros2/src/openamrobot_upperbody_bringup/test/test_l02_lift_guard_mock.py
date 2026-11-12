@@ -56,7 +56,7 @@ from lift_guard_support import (ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, LIFT, LIF
                                 joint_limits, lift_still_m, srdf_states, stack_under_test)
 
 PROFILE = "mock"
-EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["process_pattern"]]
+EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["guard_executable"]]
 
 
 @pytest.mark.launch_test

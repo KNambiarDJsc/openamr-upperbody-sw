@@ -61,7 +61,7 @@ from sim_test_support import gz_link_poses  # noqa: E402
 PROFILE = "gazebo"
 ENGINE = "gz-physics-bullet-featherstone-plugin"
 CARRIAGE, MODEL = "lift_carriage_link", "openamrobot"
-EXPECTED_PROCESSES = ["robot_state_publisher", "spawner", "move_group", INTERFACE["process_pattern"]]
+EXPECTED_PROCESSES = ["robot_state_publisher", "spawner", "move_group", INTERFACE["guard_executable"]]
 
 
 @pytest.mark.launch_test

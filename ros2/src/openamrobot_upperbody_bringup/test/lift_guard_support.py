@@ -9,7 +9,7 @@ Three things here make the tests more than a list of scripted checks:
   transition), so the oracle can check the safety properties at every moment of the run, not only where a case looks.
 - The thresholds are READ FROM THE RUNNING GUARD (its ROS parameters), so the tests follow the firmware values (#20) when they replace the
   provisional ones, and the boundary cases sit just inside and just outside whatever the guard is actually configured with. If the guard's
-  parameters cannot be read, PROVISIONAL is used and the sidecar says so.
+  parameters cannot be read, PROVISIONAL is used so that a baseline still runs, and the run is not acceptance (parameter_problems()).
 - Every reaction budget is derived from those parameters (and recorded), so "as soon as one fails" is a measured number, not a sleep.
 
 Simulation only. Nothing here is evidence about the firmware interlock (CTL-017), which stays the authority.
@@ -17,6 +17,7 @@ Simulation only. Nothing here is evidence about the firmware interlock (CTL-017)
 import contextlib
 import math
 import os
+import re
 import threading
 import time
 
@@ -42,9 +43,13 @@ INTERFACE = {
     "status_name": "lift_guard",
     "key_controller": "lift_controller",      # value: active | inactive | activating (WARN, switching on; #44 decision of 10 Nov)
     "key_blocking": "blocking",               # value: comma-separated codes, empty when OK
-    "process_pattern": "lift_guard",          # how the kill test finds the guard process
+    # The guard's and the mock odometry stub's executables, matched EXACTLY (see program_names()). A substring ("lift_guard") also matched
+    # lift_guard_odom_stub.py, so L03 killed the stub with the guard (PR #60 review, 12 Nov). The environment can name another guard
+    # (the harness's stand-in); the defaults are #53's executables.
+    "guard_executable": os.environ.get("LIFT_GUARD_EXECUTABLE", "lift_guard.py"),
+    "odom_stub_executable": os.environ.get("LIFT_GUARD_ODOM_STUB_EXECUTABLE", "lift_guard_odom_stub.py"),
     # The mock zero-odom stub (#44 decision of 10 Nov: std_srvs/SetBool on this service, and a velocity parameter, mock only). The
-    # service name is agreed; the node and parameter NAMES below are proposed by these tests, to confirm with the guard's author.
+    # service name is agreed; the node and parameter NAMES below were proposed by these tests and confirmed on #44 (11 Nov).
     # Without them the odom-loss case skips and base motion is injected on /odom beside the stub.
     "odom_stub_enable_service": "/lift_guard_odom_stub/enable",
     "odom_stub_node": "/lift_guard_odom_stub",
@@ -112,6 +117,60 @@ def value_problem(name, v):
 def srdf_states_of_both_arms(states):
     """Names of the group states that exist for left_arm AND right_arm in srdf_states()."""
     return {name for (name, group) in states if group == "left_arm"} & {name for (name, group) in states if group == "right_arm"}
+
+
+_INTERPRETER = re.compile(r"python(\d+(\.\d+)*)?$")
+
+
+def program_names(argv):
+    """The executable a process runs, as basenames: argv[0], and when argv[0] is a Python interpreter, the script it runs (its first
+    argument that is not an option). `/usr/bin/python3 -u .../lift_guard.py --ros-args ...` -> ["python3", "lift_guard.py"]. Arguments
+    after the program are never looked at, so a launcher or a shell that merely MENTIONS the executable (`ros2 run <pkg> lift_guard.py`,
+    `bash -c "... lift_guard.py"`, this test's own command line) is not that program."""
+    if not argv:
+        return []
+    names = [os.path.basename(argv[0])]
+    if _INTERPRETER.match(names[0]):
+        script = next((a for a in argv[1:] if not a.startswith("-")), None)
+        if script is not None:
+            names.append(os.path.basename(script))
+    return names
+
+
+def runs_executable(argv, env, executable, domain_id):
+    """True for a process that runs `executable` EXACTLY (a basename, e.g. "lift_guard.py": not lift_guard_odom_stub.py, not
+    wait_for_lift_guard.py) in ROS domain `domain_id`, so a guard of another stack on the machine is never selected. `env`: str -> str."""
+    return executable in program_names(argv) and env.get("ROS_DOMAIN_ID") == str(domain_id)
+
+
+def pids_running(executable, domain_id):
+    """PIDs of the processes that run `executable` in ROS domain `domain_id` (Linux /proc), never this process."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+            with open(f"/proc/{entry}/environ", "rb") as f:
+                env = dict(kv.decode(errors="replace").split("=", 1) for kv in f.read().split(b"\0") if b"=" in kv)
+        except OSError:                      # gone, or another user's process
+            continue
+        if runs_executable(argv, env, executable, domain_id):
+            pids.append(int(entry))
+    return sorted(pids)
+
+
+def launch_process_is(name, executable):
+    """Whether a launch_testing process name ("lift_guard.py-7": the executable's basename and a launch counter) is `executable`'s."""
+    return re.fullmatch(re.escape(executable) + r"-\d+", name) is not None
+
+
+def longest_gap(times, start, end):
+    """Longest stretch in [start, end] with no sample (receipt times), counting the edges: no sample at all -> end - start."""
+    inside = sorted(t for t in times if start <= t <= end)
+    edges = [start] + inside + [end]
+    return max(b - a for a, b in zip(edges, edges[1:]))
 
 
 def lift_still_m(profile):
@@ -206,6 +265,12 @@ class GuardProbe:
         self.t_created = time.monotonic()
         self.receipt_lags = []                      # s between a JointState's stamp and its receipt here (mock only)
         self.odom_samples = []                      # (t, |linear|, |angular|) of every /odom seen, for the hold-time measurement
+        self.odom_published = []                    # the same samples, each at the time its source stamped it (mock; else receipt)
+        # (t, step_s) whenever the wall clock moved against the monotonic one by more than 20 ms between two polls. In mock, ROS time is
+        # the wall clock, so a step delays every ROS timer (a stub's /odom, the guard's tick) by its size; the WSL2 host used for the
+        # evidence steps back 0.3-0.7 s several times a run (12 Nov), and the guard fails closed on it (*_STALE).
+        self.clock_steps = []
+        self._clock_offset = None
         self.params, self.params_source = dict(PROVISIONAL), "provisional (guard parameters not read yet)"
         self.params_read, self.params_unavailable = None, "the guard's parameters were not read"   # see parameter_problems()
         self.state_timeout = PROVISIONAL["state_timeout_s"]
@@ -273,9 +338,29 @@ class GuardProbe:
         tw = msg.twist.twist
         lin = math.sqrt(tw.linear.x ** 2 + tw.linear.y ** 2 + tw.linear.z ** 2)
         ang = math.sqrt(tw.angular.x ** 2 + tw.angular.y ** 2 + tw.angular.z ** 2)
+        recv_mono, recv_wall = time.monotonic(), time.time()
+        lag = recv_wall - (msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
         with self.lock:
-            self.odom_samples.append((time.monotonic(), lin, ang))
+            self.odom_samples.append((recv_mono, lin, ang))
             del self.odom_samples[:-20000]
+            # when the source PUBLISHED it (its stamp, system clock in mock), apart from when this process got to it (as _on_joints)
+            self.odom_published.append(recv_mono - lag if 0.0 <= lag <= 2.0 else recv_mono)
+            del self.odom_published[:-20000]
+
+    def clock_stepped_back(self, start, end):
+        """Total size (s, >= 0) of the backward wall-clock steps detected in [start, end]: how long a ROS timer may have been held up."""
+        with self.lock:
+            return -sum(s for t, s in self.clock_steps if start <= t <= end and s < 0)
+
+    def odom_times(self, published=False):
+        """Times of the /odom samples seen (the last 20000): when they arrived here, or with `published`, when their source stamped them."""
+        with self.lock:
+            return list(self.odom_published) if published else [t for t, _, _ in self.odom_samples]
+
+    def controller_changes(self, start, end):
+        """[(t, state)] of lift_controller's recorded state changes with start < t < end."""
+        with self.lock:
+            return [(t, s) for t, s in self.tl.controller if start < t < end]
 
     def last_moving_odom(self, linear_max, angular_max, after=0.0):
         """Receipt time of the last /odom sample at or above a threshold (or non-finite) after `after`, or None."""
@@ -316,7 +401,11 @@ class GuardProbe:
             else:
                 self.ctl_counts["polls_without_lift"] += 1
             now = time.monotonic()
+            offset = time.time() - now
             with self.lock:
+                if self._clock_offset is not None and abs(offset - self._clock_offset) > 0.02:
+                    self.clock_steps.append((now, round(offset - self._clock_offset, 3)))
+                self._clock_offset = offset
                 if self.joints:
                     devs = self._deviations(now)
                     if any(math.isinf(v) for v in devs.values()):
@@ -702,10 +791,17 @@ class GuardCase:
         cls.params_problems = parameter_problems(cls.p.params_read, cls.p.params_unavailable, srdf_states_of_both_arms(srdf_states()))
         cls.params, cls.b = cls.p.params, cls.p.budgets()
         cls.tol = float(cls.params["stowed_tolerance"])
+        # The stack's own start-up must be over before a case drives anything: #53's launch moves both arms to park once (park_arms.py),
+        # and a case's own park goal sent meanwhile preempted it, so the helper exited 1 and every survival check failed (12 Nov, first
+        # run on #53's wiring). The guard's first OK is the end of start-up as the design defines it (arms stowed, no arm goal executing,
+        # the lift allowed). Only observed, never asserted here (L02-00 judges start-up); without a guard (main's baseline) no wait.
+        startup = cls.p.wait_allowed(STARTUP_WITHIN_S[cls.PROFILE]) if cls.p.params_read is not None else None
+        cls.startup_complete_s = None if startup is None else round(time.monotonic() - cls.p.t_created, 3)
         cls.record = {"profile": cls.PROFILE, "stack_launch": os.environ.get("LIFT_GUARD_STACK_LAUNCH", "bringup moveit.launch.py"),
                       "double_mutant": os.environ.get("LIFT_GUARD_DOUBLE_MUTANT"), "interface": INTERFACE,
                       "parameters": {k: cls.params.get(k) for k in PARAMETERS}, "parameters_source": cls.p.params_source,
                       "budgets_s": cls.b.as_dict(), "slack": SLACK, "cases": {},
+                      "startup_complete_after_probe_s": cls.startup_complete_s,
                       "acceptance": {"eligible": not cls.params_problems, "parameter_problems": cls.params_problems,
                                      "note": None if not cls.params_problems else
                                      "NOT ACCEPTANCE: provisional values were used; every case and the properties fail (PR #60 review)"}}
@@ -721,6 +817,9 @@ class GuardCase:
         t0 = cls.p.status_changes[0][0] if cls.p.status_changes else cls.p.t_created
         cls.record["controller_recording"] = {**cls.p.ctl_counts, "probe_created_s": round(cls.p.t_created - t0, 3),
                                               "first_entries": [(round(t - t0, 3), st) for t, st in cls.p.tl.controller[:12]]}
+        from lift_guard_oracle import label_at
+        tl = cls.p.timeline()
+        cls.record["wall_clock_steps"] = [{"t": round(t - t0, 3), "step_s": s, "case": label_at(tl, t)} for t, s in cls.p.clock_steps][:100]
         cls.record["arm_state_receipt_lag_s"] = {"samples": len(lags), "p50": round(lags[len(lags) // 2], 4),
                                                  "p99": round(lags[int(len(lags) * 0.99)], 4),
                                                  "max": round(lags[-1], 4)} if lags else None
@@ -792,11 +891,34 @@ class GuardCase:
         return accepted, t0
 
     # ---- the run-wide properties ------------------------------------------------------------------------------------------------------
+    # Set by a case that ends the guard (L03): statuses received after the guard's process exited are not a live guard's statements.
+    # A SIGKILLed writer's last samples can be held by reliable delivery and released seconds later (12 Nov, #53: two OK statuses
+    # arrived 3.1 s after the kill, with the exit handler's deactivation), so the oracle judges statuses up to the exit only.
+    status_valid_until = None
+
     def check_properties(self):
-        from lift_guard_oracle import evaluate
-        result = evaluate(self.p.timeline(), tolerance=self.tol, known_codes=CODES, settle=self.b.settle, eps=lift_still_m(self.PROFILE),
+        from lift_guard_oracle import evaluate, label_at
+        tl = self.p.timeline()
+        if self.status_valid_until is not None:
+            dropped = [e for e in tl.status if e[0] > self.status_valid_until]
+            tl.status = [e for e in tl.status if e[0] <= self.status_valid_until]
+            tl.status_end = self.status_valid_until            # and the last one stops being a statement there
+            self.record["statuses_after_the_guard_exited"] = {"count": len(dropped), "judged": False,
+                                                              "first": [(round(e[0] - self.status_valid_until, 3), e[1]) for e in dropped[:5]]}
+        result = evaluate(tl, tolerance=self.tol, known_codes=CODES, settle=self.b.settle, eps=lift_still_m(self.PROFILE),
                           reaction=self.b.pose_reaction, lag=self.b.status_lag, warn_max=self.b.warn_max)
         self.record["properties"] = {k: {"violations": len(v), "first": v[:5]} for k, v in result.items()}
+        # Context for each of the first violations: what the guard said, what lift_controller did and how the wall clock stepped around it
+        context = []
+        for v in [v for vs in result.values() for v in vs[:3]]:
+            t = v.get("at", v.get("from"))
+            if t is None:
+                continue
+            near = lambda events: [(round(e[0] - t, 3), *e[1:]) for e in events if abs(e[0] - t) <= 1.5]  # noqa: E731
+            context.append({"property": v["property"], "case": label_at(tl, t), "statuses": near(tl.status)[:40],
+                            "controller": near(tl.controller), "wall_clock_steps": near(self.p.clock_steps)})
+        if context:
+            self.record["violation_context"] = context
         broken = {k: v[:3] for k, v in result.items() if v}
         self.assertFalse(broken, f"safety properties broken during the run: {broken}")
         self.require_guard_parameters()

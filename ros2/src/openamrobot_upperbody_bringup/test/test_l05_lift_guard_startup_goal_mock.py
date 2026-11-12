@@ -31,7 +31,7 @@ from lift_guard_support import INTERFACE, LIFT_SPEED, GuardCase, lift_still_m, s
 
 PROFILE = "mock"
 LIFT_POSITION = 0.05
-EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["process_pattern"]]
+EXPECTED_PROCESSES = ["robot_state_publisher", "ros2_control_node", "spawner", "move_group", INTERFACE["guard_executable"]]
 
 
 @pytest.mark.launch_test

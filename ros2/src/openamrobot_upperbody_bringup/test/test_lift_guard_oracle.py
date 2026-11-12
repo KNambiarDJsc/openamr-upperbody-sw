@@ -201,5 +201,51 @@ def test_p3_a_guard_that_never_deactivates_is_found_even_while_reporting_error()
 
 
 def test_p6_a_short_activation_inside_the_lag_counts_even_if_it_is_over_again_at_the_end_of_the_window():
-    tl = Timeline(end=5.0, status=[(1.0, OK, "inactive", ())], controller=[(0.0, "inactive"), (1.1, "active"), (1.4, "inactive")])
+    # The status is a step function since 12 Nov, so the guard's next status (ERROR at 1.45) is part of the scenario: without it, the OK
+    # would hold, with the controller inactive, until the end of the run.
+    tl = Timeline(end=5.0, status=[(1.0, OK, "inactive", ()), (1.45, ERROR, "inactive", ("ARM_NOT_STOWED_LEFT",))],
+                  controller=[(0.0, "inactive"), (1.1, "active"), (1.4, "inactive")])
     assert evaluate(tl, **ARGS)["P6_allowed_means_active"] == []
+
+
+def test_p6_an_ok_in_flight_across_a_deactivation_is_not_a_breach():
+    """12 Nov, the first run on the integrated stack (L02-03, 07, 10): WARN, OK while active, the deactivation event, an OK published
+    before it arriving 4 ms after it, then ERROR 7 ms later. The mismatch lasted milliseconds; the per-status check flagged it."""
+    tl = Timeline(end=5.0, status=[(0.942, WARN, "activating", ()), (0.995, OK, "active", ()), (1.0, OK, "active", ()),
+                                   (1.007, ERROR, "inactive", ("ARM_TRAJECTORY_ACTIVE_RIGHT",))],
+                  controller=[(0.0, "inactive"), (0.942, "active"), (0.996, "inactive")])
+    assert evaluate(tl, **ARGS)["P6_allowed_means_active"] == []
+
+
+def test_p6_a_guard_that_keeps_saying_ok_after_the_deactivation_is_found_with_how_long():
+    oks = [(1.0 + 0.1 * i, OK, "active", ()) for i in range(9)]               # 1.0 .. 1.8
+    tl = Timeline(end=5.0, status=oks + [(1.9, ERROR, "inactive", ("ARM_NOT_STOWED_LEFT",))],
+                  controller=[(0.0, "active"), (1.05, "inactive")])
+    found = evaluate(tl, **ARGS)["P6_allowed_means_active"]
+    assert len(found) == 1 and found[0]["status"] == "OK" and math.isclose(found[0]["for_s"], 0.85, abs_tol=1e-6), found
+
+
+def test_p6_an_error_the_controller_follows_within_the_lag_is_not_a_breach_and_one_it_does_not_is():
+    follows = Timeline(end=5.0, status=[(1.0, OK, "active", ()), (2.0, ERROR, "active", ("BASE_MOVING",))],
+                       controller=[(0.0, "active"), (2.3, "inactive")])
+    assert evaluate(follows, **ARGS)["P6_allowed_means_active"] == []
+    stuck = Timeline(end=5.0, status=follows.status, controller=[(0.0, "active"), (2.8, "inactive")])
+    found = evaluate(stuck, **ARGS)["P6_allowed_means_active"]
+    assert len(found) == 1 and found[0]["status"] == "ERROR" and math.isclose(found[0]["for_s"], 0.8, abs_tol=1e-6), found
+
+
+def test_p6_p1_p7_a_dead_guard_says_nothing():
+    """L03: once the guard's process has exited, its last status is not a statement any more (Timeline.status_end)."""
+    tl = Timeline(end=10.0, status=[(1.0, OK, "active", ())], controller=[(0.0, "active"), (2.2, "inactive")], status_end=2.0)
+    assert evaluate(tl, **ARGS)["P6_allowed_means_active"] == []
+    tl.status_end = None                                       # the same OK, still held: a breach
+    assert evaluate(tl, **ARGS)["P6_allowed_means_active"]
+    warn = Timeline(end=30.0, status=[(1.0, WARN, "activating", ())], controller=[(0.0, "inactive")], status_end=2.0)
+    assert evaluate(warn, **ARGS)["P7_switching_on_is_brief"] == []
+    warn.status_end = None
+    assert evaluate(warn, **ARGS)["P7_switching_on_is_brief"]
+    blocked = Timeline(end=10.0, status=[(1.0, ERROR, "inactive", ("BASE_MOVING",))], controller=[(0.0, "active")],
+                       lift=[(3.0, 0.10), (6.0, 0.13)], status_end=2.0)
+    assert evaluate(blocked, **ARGS)["P1_no_motion_while_blocked"] == []
+    blocked.status_end = None
+    assert evaluate(blocked, **ARGS)["P1_no_motion_while_blocked"]
