@@ -6,8 +6,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lift_guard_oracle import (ERROR, OK, WARN, Timeline, arm_deviation, evaluate, no_motion_while_blocked, unobserved,  # noqa: E402
-                               no_motion_while_inactive, step_intervals)
+from lift_guard_oracle import (ERROR, OK, WARN, Timeline, arm_deviation, evaluate, first_not_active_after,  # noqa: E402
+                               no_motion_while_blocked, no_motion_while_inactive, step_intervals, stowed_deviation, unobserved)
 
 CODES = ("ARM_NOT_STOWED_LEFT", "ARM_NOT_STOWED_RIGHT", "ARM_TRAJECTORY_ACTIVE_LEFT", "ARM_TRAJECTORY_ACTIVE_RIGHT",
          "ARM_STATE_MISSING", "ARM_STATE_STALE", "BASE_MOVING", "ODOM_MISSING", "ODOM_STALE", "SWITCH_FAILED")
@@ -310,3 +310,47 @@ def test_p1_p2_start_up_before_the_first_lift_sample_is_not_a_gap_but_a_gap_afte
     broken = [(2.1 + t / 10, 0.1) for t in range(0, 20)] + [(7.0 + t / 10, 0.1) for t in range(0, 20)]     # silent 4.0 .. 7.0
     found = evaluate(Timeline(end=9.0, lift=broken, **BLOCKED), **ARGS)["P1_no_motion_while_blocked"]
     assert len(found) == 1 and found[0]["unobserved"] and found[0]["gap_s"] > 2.9, found
+
+
+# ---- stowed means the guard's stowed_states, not park alone (#44, 12 Nov: robot rule is stowed OR carry) ---------------------------------
+J = ["a", "b"]
+PARK, CARRY = {"a": 0.0, "b": 0.0}, {"a": 1.0, "b": -0.5}
+
+
+def test_stowed_deviation_with_one_pose_is_the_old_distance_to_park():
+    for pos in ({"a": 0.0, "b": 0.0}, {"a": 0.03, "b": -0.01}, {"a": 1.0, "b": -0.5}):
+        assert stowed_deviation(pos, [PARK], J) == arm_deviation(pos, PARK, J)
+
+
+def test_stowed_deviation_is_the_distance_to_the_closest_stowed_pose():
+    at_carry = {"a": 1.0, "b": -0.5}
+    assert stowed_deviation(at_carry, [PARK], J) == 1.0                    # park only: carry is not stowed
+    assert stowed_deviation(at_carry, [PARK, CARRY], J) == 0.0             # park or carry: it is
+    assert math.isclose(stowed_deviation({"a": 1.02, "b": -0.5}, [PARK, CARRY], J), 0.02)
+    assert math.isclose(stowed_deviation({"a": 0.5, "b": -0.25}, [PARK, CARRY], J), 0.5)      # between the two is neither
+
+
+def test_stowed_deviation_never_reads_a_missing_or_non_finite_joint_as_stowed():
+    assert stowed_deviation({"a": 0.0}, [PARK, CARRY], J) == math.inf
+    assert stowed_deviation({"a": 0.0, "b": math.nan}, [PARK, CARRY], J) == math.inf
+    assert stowed_deviation({"a": 0.0, "b": 0.0}, [], J) == math.inf       # no stowed pose known: nothing is stowed
+
+
+def test_p3_follows_stowed_states_an_arm_at_a_declared_carry_pose_is_not_a_breach():
+    """The recorder's per-arm deviation is stowed_deviation. An arm that sits at carry while the guard says OK is a breach if only park
+    is stowed, and none once carry is declared: the oracle must not encode park as the permanent rule."""
+    ok = dict(status=[(0.0, OK, "active", ())], controller=[(0.0, "active")], end=10.0)
+    park_only = Timeline(arms=[(0.0, {"left": 0.0, "right": 0.0}), (3.0, {"left": stowed_deviation(CARRY, [PARK], J), "right": 0.0})], **ok)
+    either = Timeline(arms=[(0.0, {"left": 0.0, "right": 0.0}), (3.0, {"left": stowed_deviation(CARRY, [PARK, CARRY], J), "right": 0.0})], **ok)
+    assert evaluate(park_only, **ARGS)["P3_arm_out_is_blocked"], "park only: an arm at carry with the guard allowing is out"
+    assert evaluate(either, **ARGS)["P3_arm_out_is_blocked"] == []
+
+
+def test_first_not_active_after_is_a_step_function_of_the_controller():
+    ctl = [(0.0, "active"), (5.0, "inactive"), (9.0, "active")]
+    assert first_not_active_after(ctl, 4.0) == 5.0                          # went inactive later
+    assert first_not_active_after(ctl, 6.0) == 6.0                          # already inactive at the crossing: zero, not None
+    assert first_not_active_after(ctl, 9.5) is None                         # active from then on
+    assert first_not_active_after([], 1.0) is None
+    assert first_not_active_after([(2.0, "inactive")], 1.0) == 2.0           # nothing known before; the first sample after counts
+    assert first_not_active_after([(0.0, "active"), (3.0, "activating")], 1.0) == 3.0

@@ -13,6 +13,17 @@ Three things here make the tests more than a list of scripted checks:
 - Every reaction budget is derived from those parameters (and recorded), so "as soon as one fails" is a measured number, not a sleep.
 
 Simulation only. Nothing here is evidence about the firmware interlock (CTL-017), which stays the authority.
+
+Not covered here, and owned elsewhere (#44, 12 Nov):
+- Safe arm poses: the robot rule is stowed OR carry; the guard enables `park` only until the owners define carry (an SRDF state plus
+  stowed_states). The oracle follows the guard's stowed_states and the SRDF, and L02-15 drives every state the guard declares; the cases
+  that DRIVE the arms (start-up, 'out of park') use park, the only state defined today. Carry itself is untested until it exists.
+- Base-stopped thresholds: read from the guard and tested on both sides of whatever it is configured with. Whether they equal the firmware
+  values (D14, platform-fw #20) is open; this suite does not choose them.
+- Stopping: the times and travel it records are measurements of the simulation, not accepted stopping limits (D16, platform-fw #20). The
+  budgets below are the test's own tolerances, derived from the lift speed the tests ask for.
+- A guard that is alive but not evaluating (D12 keep-alive/heartbeat) and base or arm motion while the lift moves (motion arbitration,
+  platform-sw #87, manipulation #24) are not the guard's job and are not tested here.
 """
 import contextlib
 import math
@@ -35,7 +46,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from lift_guard_oracle import Timeline, arm_deviation
+from lift_guard_oracle import Timeline, stowed_deviation
 
 # ---- the guard's interface, as proposed on #44 (one place to change if it changes) -------------------------------------------------------
 INTERFACE = {
@@ -197,6 +208,7 @@ class Budgets:
         self.kill_deactivate = 10.0 * SLACK   # includes the start-up of the `ros2 control` CLI in the design's exit handler
         self.status_lag = 2 * tick + 0.3
         self.settle = 0.3 if profile == "mock" else 0.6                                     # after a block, before "did not move" applies
+        # the TEST's tolerance for an arm leaving park (what the guard's reaction time allows at the speed the tests command), not a stopping limit
         self.travel_after_violation = LIFT_SPEED * self.pose_reaction + lift_still_m(profile)
         # WARN ("activating") must end: OK, or ERROR with SWITCH_FAILED once the guard's own switch timeout has run out
         self.warn_max = (float(params.get("switch_timeout_s", 2.0)) + 1.0 + 2 * tick + SWITCH_S) * SLACK
@@ -248,12 +260,20 @@ def park_positions(states):
     return {j: states[("park", f"{side}_arm")][j] for side in ARM_JOINTS for j in ARM_JOINTS[side]}
 
 
+def stowed_poses(names, states):
+    """The full arm pose of each named group state that exists for BOTH arms in `states` (srdf_states()): the poses the guard accepts as
+    stowed when it is configured with `names`. Names that are not group states of both arms are left out (parameter_problems reports them)."""
+    return [{j: states[(n, f"{side}_arm")][j] for side in ARM_JOINTS for j in ARM_JOINTS[side]} for n in names
+            if all(j in states.get((n, f"{side}_arm"), {}) for side in ARM_JOINTS for j in ARM_JOINTS[side])]
+
+
 class GuardProbe:
     """A client of the stack with its own executor thread, recording everything the oracle needs. All times are time.monotonic()."""
 
     def __init__(self, profile, node_name, park):
         self.profile = profile
         self.park = park
+        self.stowed = [park]            # what the oracle calls stowed; follows the guard's stowed_states once they are read (use_stowed_states)
         self.node = rclpy.create_node(node_name)
         self.lock = threading.Lock()
         self.tl = Timeline()
@@ -303,7 +323,15 @@ class GuardProbe:
     # ---- recording ----------------------------------------------------------------------------------------------------------------------
     def _deviations(self, now):
         fresh = {j: p for j, p in self.joints.items() if now - self.joint_t.get(j, -1e9) <= self.state_timeout}
-        return {side: arm_deviation(fresh, self.park, ARM_JOINTS[side]) for side in ARM_JOINTS}
+        return {side: stowed_deviation(fresh, self.stowed, ARM_JOINTS[side]) for side in ARM_JOINTS}
+
+    def use_stowed_states(self, names, states):
+        """The oracle's definition of 'stowed' follows the guard's own stowed_states (read from it) and the SRDF, so it does not encode park as
+        the permanent rule: the robot-level rule is stowed OR carry, park is today's conservative simulation state, and carry joins when the
+        owners define it. Park stays the reference for what the cases DRIVE (park_side, start-up, 'out of park')."""
+        poses = stowed_poses(names, states)
+        if poses:
+            self.stowed = poses
 
     def _on_joints(self, msg):
         """Each sample is placed at the moment it was MEASURED, not when this process got to it. The guard decides from the same samples,
@@ -818,6 +846,8 @@ class GuardCase:
         cls.p.read_guard_parameters(timeout=30.0 if cls.PROFILE == "mock" else 90.0)
         cls.params_problems = parameter_problems(cls.p.params_read, cls.p.params_unavailable, srdf_states_of_both_arms(srdf_states()))
         cls.params, cls.b = cls.p.params, cls.p.budgets()
+        if not cls.params_problems:
+            cls.p.use_stowed_states(cls.params["stowed_states"], srdf_states())
         cls.tol = float(cls.params["stowed_tolerance"])
         # The stack's own start-up must be over before a case drives anything: #53's launch moves both arms to park once (park_arms.py),
         # and a case's own park goal sent meanwhile preempted it, so the helper exited 1 and every survival check failed (12 Nov, first

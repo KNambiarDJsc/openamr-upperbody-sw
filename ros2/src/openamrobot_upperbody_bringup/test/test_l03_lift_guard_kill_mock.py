@@ -9,6 +9,7 @@ Measured and checked, in this order:
   1  time from the signal to lift_controller inactive, and to the guard process exiting. Decided on #44 (10 Nov): on SIGTERM the node
      deactivates lift_controller ITSELF before it exits, so with TERM the deactivation must come no later than the exit (+0.3 s for event
      delivery; the OnProcessExit handler cannot act before the exit and needs over a second for the CLI); SIGKILL is the handler's case
+     (from the SIGNAL to the guard, a process-death case; the time from an unsafe CONDITION to deactivation is measured in L02-10)
   2  moving: time to lift_joint standing still, and the travel after the signal
   3  the hold: lift_joint stays put afterwards
   4  further commands are rejected: the action goal is not accepted and a topic trajectory does not move the lift

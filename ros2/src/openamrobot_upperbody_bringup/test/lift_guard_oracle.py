@@ -291,6 +291,27 @@ def arm_deviation(positions, park, joints):
     return worst
 
 
+def stowed_deviation(positions, poses, joints):
+    """Largest |position - pose| over `joints` for the CLOSEST of the stowed `poses`: the guard's own rule per arm (every joint within the
+    tolerance of ANY stowed state), so the oracle follows stowed_states and does not assume park is the only safe pose (robot rule: stowed
+    OR carry). inf if a joint is missing or not finite, or if there is no pose to compare with."""
+    return min((arm_deviation(positions, pose, joints) for pose in poses), default=math.inf)
+
+
+def first_not_active_after(controller, t):
+    """When lift_controller was first seen not active at or after `t`: `t` itself if its last known state at `t` was not active (a step
+    function, like the status), else the first later sample that is; None if it never was, or if nothing was known."""
+    state = None
+    for s in controller:
+        if s[0] <= t:
+            state = s[1]
+        elif state is not None and state != "active":
+            break
+        elif s[1] != "active":
+            return s[0]
+    return t if state is not None and state != "active" else None
+
+
 def first_crossing(series, predicate, after=0.0):
     """Time of the first (t, ...) sample at or after `after` where `predicate(sample)` holds, or None."""
     for s in series:

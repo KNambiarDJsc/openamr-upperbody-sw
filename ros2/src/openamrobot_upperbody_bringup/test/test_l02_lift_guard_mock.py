@@ -21,7 +21,10 @@ Cases
   08 arm out: the action is rejected, the topic does not move the lift up or down, and nothing replays after the arm is parked again
   09 lift_controller activated from outside while blocked: deactivated again within the reaction budget, lift travel bounded, and every
      status in the window is ERROR naming the cause (#44, 10 Nov: "blocking naming the cause")
-  10 an arm leaves park during a lift move, up (left) and down (right): the lift stops within the travel budget, holds, does not resume
+  10 an arm leaves park during a lift move, up (left) and down (right): the lift stops within the travel budget, holds, does not resume.
+     Measured from the unsafe condition, not from a signal: from the arm command and from the joints' crossing of the tolerance, the time to
+     the guard's ERROR, to lift_controller inactive, and the lift's travel (recorded; the budget is the test's own tolerance, not an
+     accepted stopping limit)
   11 arm state stops (joint_state_broadcaster deactivated): blocked with ARM_STATE_STALE or ARM_STATE_MISSING
   12 injected arm state: fresh and parked allows; one joint absent from every message blocks (freshness per joint); a NaN blocks
   13 MoveIt: a lift request through move_group with an arm out does not move the lift
@@ -52,7 +55,7 @@ from rclpy.qos import DurabilityPolicy, ReliabilityPolicy  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a7_support import A7_ENABLED, SKIP_REASON, stack_alive, stack_healthy  # noqa: E402
-from lift_guard_oracle import first_crossing  # noqa: E402
+from lift_guard_oracle import ERROR, first_crossing, first_not_active_after  # noqa: E402
 from lift_guard_support import (ALL_ARM_JOINTS, ARM_JOINTS, INTERFACE, LIFT, LIFT_CONTROLLER, START_HEIGHT, GuardCase,  # noqa: E402
                                 joint_limits, lift_still_m, pids_running, srdf_states, stack_under_test)
 
@@ -327,11 +330,26 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
             t_cross = first_crossing(tl.arms, lambda e: e[1][side] > self.tol, after=t_cmd)
             at_cross = next((p for t, p in reversed(tl.lift) if t <= (t_cross or 0)), None)
             travel = abs(stopped - at_cross) if at_cross is not None else None
+            # Two references, kept apart. FROM THE COMMAND: when the test sent the arm away, to the guard's ERROR, to lift_controller not
+            # active and to the lift's stop (the guard acts on the arm controller's own reference, so this is the whole reaction). FROM THE
+            # CROSSING: when /joint_states first showed the arm outside the tolerance (later than the command; 0.0 means the guard had
+            # already acted). Measured values of the simulation, not accepted stopping limits (D16, platform-fw #20).
+            blocks_this_arm = lambda e: e[1] == ERROR and f"ARM_NOT_STOWED_{side.upper()}" in e[3]  # noqa: E731
+            t_error_cmd = first_crossing(tl.status, blocks_this_arm, after=t_cmd)
+            t_inactive_cmd = first_not_active_after(tl.controller, t_cmd)
+            at_cmd = next((p for t, p in reversed(tl.lift) if t <= t_cmd), None)
+            t_error = None if t_cross is None else first_crossing(tl.status, blocks_this_arm, after=t_cross)
+            t_inactive = None if t_cross is None else first_not_active_after(tl.controller, t_cross)
             t_hold = time.monotonic()
             time.sleep(2.0)
             hold = self.p.lift_motion_since(t_hold)
             rows[side] = {"direction": "up" if delta > 0 else "down", "accepted": accepted, "goal_status": status,
                           "blocked": blocked is not None, "travel_after_crossing_m": None if travel is None else round(travel, 5),
+                          "command_to_error_s": None if t_error_cmd is None else round(t_error_cmd - t_cmd, 3),
+                          "command_to_inactive_s": None if t_inactive_cmd is None else round(t_inactive_cmd - t_cmd, 3),
+                          "travel_after_command_m": None if at_cmd is None else round(abs(stopped - at_cmd), 5),
+                          "crossing_to_error_s": None if t_error is None else round(t_error - t_cross, 3),
+                          "crossing_to_inactive_s": None if t_inactive is None else round(t_inactive - t_cross, 3),
                           "stopped_at": stopped, "target": l0 + delta, "hold_m": round(hold, 5)}
             self.p.arm_goal(side, self.p.park_side(side), seconds=1.5)
             self.p.wait_allowed(self.b.allow_within)
@@ -341,6 +359,7 @@ class TestLiftGuardArmsMock(GuardCase, unittest.TestCase):
             self.assertTrue(r["accepted"], f"{side}: the lift goal was rejected before the arm moved (precondition)")
             self.assertGreater(abs(r["target"] - r["stopped_at"]), 0.005, f"{side}: the lift reached its target although the arm left park")
             self.assertIsNotNone(r["travel_after_crossing_m"], f"{side}: the arm never crossed the tolerance in the recording")
+            self.assertIsNotNone(r["command_to_inactive_s"], f"{side}: lift_controller was never seen not active after the arm was sent away")
             self.assertLessEqual(r["travel_after_crossing_m"], self.b.travel_after_violation,
                                  f"{side}: the lift travelled {r['travel_after_crossing_m']:.4f} m after the arm left the tolerance")
             self.assertLessEqual(r["hold_m"], lift_still_m(PROFILE), f"{side}: no hold after the stop")

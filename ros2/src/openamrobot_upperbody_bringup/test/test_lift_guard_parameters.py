@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lift_guard_oracle import OK, Timeline  # noqa: E402
-from lift_guard_support import PARAMETERS, GuardCase, parameter_problems  # noqa: E402
+from lift_guard_support import ARM_JOINTS, PARAMETERS, GuardCase, GuardProbe, parameter_problems, stowed_poses  # noqa: E402
 
 VALID = {"stowed_states": ["park"], "stowed_tolerance": 0.01, "reference_velocity_max": 0.001, "arm_state_topic": "/joint_states",
          "odom_topic": "/odom", "base_linear_speed_max": 0.01, "base_angular_speed_max": 0.01, "base_stopped_hold_s": 0.5,
@@ -114,3 +114,41 @@ def test_a_recording_with_nothing_in_it_is_not_a_pass_even_with_the_guards_own_v
     with pytest.raises(AssertionError, match="recorded too little"):
         c.check_properties()
     assert c.record["lift_observation"]["samples"] == 0
+
+
+# ---- the stowed poses the oracle uses come from the guard's stowed_states and the SRDF ---------------------------------------------------
+def _srdf(*names, missing=()):
+    return {(n, f"{side}_arm"): {j: float(i) for i, j in enumerate(ARM_JOINTS[side])}
+            for n in names for side in ARM_JOINTS if (n, side) not in missing}
+
+
+def test_stowed_poses_follow_the_declared_states_in_order():
+    states = _srdf("park", "carry", "hands_up")
+    poses = stowed_poses(["park", "carry"], states)
+    assert len(poses) == 2 and all(len(p) == 14 for p in poses)
+    assert stowed_poses(["park"], states) == poses[:1]
+    assert stowed_poses([], states) == []
+
+
+def test_stowed_poses_leave_out_a_state_that_is_not_defined_for_both_arms():
+    states = _srdf("park", "carry", missing=[("carry", "right")])
+    assert len(stowed_poses(["park", "carry"], states)) == 1               # parameter_problems names the rest
+    assert stowed_poses(["carry"], states) == []
+    assert stowed_poses(["nonexistent"], states) == []
+
+
+def test_the_probe_judges_arms_against_every_state_the_guard_declares_and_defaults_to_park():
+    """GuardProbe._deviations feeds P3. Built without a ROS node: only the recorded joint values and the stowed poses matter here."""
+    states = {(n, f"{side}_arm"): {j: v + i * 0.1 for i, j in enumerate(ARM_JOINTS[side])}
+              for n, v in (("park", 0.0), ("carry", 1.0)) for side in ARM_JOINTS}
+    probe = object.__new__(GuardProbe)
+    probe.joints = {j: 1.0 + i * 0.1 for side in ARM_JOINTS for i, j in enumerate(ARM_JOINTS[side])}       # exactly the carry pose
+    probe.joint_t, probe.state_timeout = {j: 100.0 for j in probe.joints}, 0.5
+    probe.park = {j: v for (n, _), pose in states.items() if n == "park" for j, v in pose.items()}
+    probe.stowed = [probe.park]
+    assert min(probe._deviations(100.0).values()) > 0.5                      # park only (before the guard's stowed_states are read)
+    probe.use_stowed_states(["park", "carry"], states)
+    assert probe._deviations(100.0) == {"left": 0.0, "right": 0.0}           # park or carry
+    probe.use_stowed_states(["nonexistent"], states)
+    assert probe._deviations(100.0) == {"left": 0.0, "right": 0.0}           # nothing usable declared: the previous poses stay
+    assert probe._deviations(200.0) == {"left": math.inf, "right": math.inf}  # stale joint values never read as stowed
